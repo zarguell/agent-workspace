@@ -1,0 +1,45 @@
+baseDomain: example.com
+idleTimeoutMinutes: 15
+images:
+  controlPlane: localhost:5000/agent-control-plane
+  gateway: localhost:5000/agent-gateway
+  tag: dev-latest
+  workspace: localhost:5000/agent-workspace
+postgres:
+  database: agentplatform
+  password: changeme
+  storage: 10Gi
+  storageClass: local-path
+  user: agentplatform
+resources:
+  controlPlane:
+    limits:
+      cpu: 1
+      memory: 2Gi
+    requests:
+      cpu: 250m
+      memory: 512Mi
+  gateway:
+    limits:
+      cpu: 1
+      memory: 2Gi
+    requests:
+      cpu: 250m
+      memory: 512Mi
+  postgres:
+    limits:
+      cpu: 1
+      memory: 2Gi
+    requests:
+      cpu: 250m
+      memory: 512Mi
+serviceAuthToken: dev-service-token-123
+workspaceDefaults:
+  resourceLimits:
+    cpu: 2
+    memory: 4Gi
+  resourceRequests:
+    cpu: 512m
+    memory: 1Gi
+  storageClass: local-path
+  storageSize: 10Gi

@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: control-plane
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: control-plane
+      containers:
+        - name: control-plane
+          image: "{{ .Values.images.controlPlane }}:{{ .Values.images.tag }}"
+          ports:
+            - containerPort: 80
+              protocol: TCP
+              name: http
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: database-url
+            - name: SERVICE_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: service-auth-secret
+                  key: token
+            - name: COOKIE_DOMAIN
+              value: {{ printf ".%s" .Values.baseDomain | quote }}
+            - name: WORKSPACE_IMAGE
+              value: "{{ .Values.images.workspace }}:{{ .Values.images.tag }}"
+            - name: PASEO_PASSWORD
+            - name: ANTHROPIC_API_KEY
+              value: "{{ .Values.anthropicApiKey }}"
+              value: "{{ .Values.workspaceDefaults.paseoPassword | default (uuidv4) }}"
+          resources:
+            requests:
+              cpu: {{ .Values.resources.controlPlane.requests.cpu }}
+              memory: {{ .Values.resources.controlPlane.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.controlPlane.limits.cpu }}
+              memory: {{ .Values.resources.controlPlane.limits.memory }}

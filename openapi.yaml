@@ -1,0 +1,993 @@
+openapi: "3.1.0"
+info:
+  title: Agent Workspace Platform API
+  version: "0.2.0"
+  description: |
+    API contract for the local agent workspace MVP.
+    Three API surfaces defined in one spec:
+    - Control Plane: auth, workspace lifecycle, audit
+    - Gateway: proxy route contracts (no REST endpoints)
+    - Workspace Agent: per-pod readiness, exposure registry, activity
+
+servers:
+  - url: http://{domain}
+    description: Platform gateway (external entry point)
+  - url: http://control-plane.agent-platform.svc.cluster.local:80
+    description: Control plane internal cluster service
+
+tags:
+  - name: Auth
+    description: Login, logout, session management
+  - name: Workspaces
+    description: Workspace lifecycle
+  - name: Admin
+    description: Admin-only operations and audit
+  - name: Agent
+    description: Per-workspace-pod agent endpoints (internal)
+
+# ═══════════════════════════════════════════════════════════════════
+# PATHS
+# ═══════════════════════════════════════════════════════════════════
+
+paths:
+
+  # ─── Auth ───────────────────────────────────────────────────────
+
+  /api/login:
+    post:
+      tags: [Auth]
+      summary: Authenticate user and establish session
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  example: alice
+                password:
+                  type: string
+                  example: password123
+      responses:
+        "200":
+          description: Login succeeded
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+                description: HTTP-only, SameSite=Strict session cookie
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "401":
+          description: Invalid credentials or account disabled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/logout:
+    post:
+      tags: [Auth]
+      summary: Destroy session
+      operationId: logout
+      responses:
+        "200":
+          description: Session destroyed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+
+  /api/session:
+    get:
+      tags: [Auth]
+      summary: Validate current session, return user info
+      operationId: getSession
+      responses:
+        "200":
+          description: Valid session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "401":
+          description: No valid session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ─── Workspaces ─────────────────────────────────────────────────
+
+  /api/workspaces:
+    get:
+      tags: [Workspaces]
+      summary: List workspaces for the authenticated user
+      description: |
+        Each authenticated user has exactly one workspace.
+        Created implicitly on first login if it does not exist.
+      operationId: listWorkspaces
+      responses:
+        "200":
+          description: Workspace list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Workspace"
+
+  /api/workspaces/{workspaceId}:
+    get:
+      tags: [Workspaces]
+      summary: Get workspace details (user-safe)
+      operationId: getWorkspace
+      parameters:
+        - name: workspaceId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Workspace details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "403":
+          description: Not authorized
+        "404":
+          description: Not found
+
+  /api/workspaces/{workspaceId}/start:
+    post:
+      tags: [Workspaces]
+      summary: |
+        Idempotent start — provisions or resumes a workspace.
+        Acceptable from: requested, failed, hibernated, starting, running.
+        - requested/failed/hibernated → reconcile toward starting
+        - starting → return current state (no duplicate pod)
+        - running → return current state (no-op)
+        - deleting/deleted → reject 409
+      operationId: startWorkspace
+      parameters:
+        - name: workspaceId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          schema:
+            type: string
+            format: uuid
+          description: Client-generated idempotency key (prevents duplicate starts on retry)
+      responses:
+        "202":
+          description: Start accepted — workspace transitioning to starting
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "200":
+          description: Workspace already running or starting (no-op)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "409":
+          description: Workspace is deleting/deleted — cannot start
+
+  /api/workspaces/{workspaceId}/hibernate:
+    post:
+      tags: [Workspaces]
+      summary: Scale workspace to zero replicas
+      operationId: hibernateWorkspace
+      parameters:
+        - name: workspaceId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          schema:
+            type: string
+      responses:
+        "202":
+          description: Hibernation accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+
+  /api/workspaces/{workspaceId}/status:
+    get:
+      tags: [Workspaces]
+      summary: User-safe workspace runtime status
+      description: |
+        Returns information safe to expose to the browser.
+        Never returns: pod name, IP, namespace, ClusterIP, PVC name, stack traces.
+      operationId: getWorkspaceStatus
+      parameters:
+        - name: workspaceId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Workspace runtime status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceStatus"
+
+  # ─── Internal routing status (gateway → control plane) ─────────
+
+  /api/internal/workspaces/{workspaceId}/routing:
+    get:
+      tags: [Workspaces]
+      summary: Internal routing status (gateway use only)
+      description: |
+        Returns routing metadata the gateway needs to proxy requests.
+        Requires internal service auth — not accessible via browser session.
+      operationId: getWorkspaceRoutingStatus
+      parameters:
+        - name: workspaceId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Routing metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceRoutingStatus"
+
+  # ─── Admin ──────────────────────────────────────────────────────
+
+  /api/admin/workspaces:
+    get:
+      tags: [Admin]
+      summary: List all workspaces
+      operationId: adminListWorkspaces
+      responses:
+        "200":
+          description: All workspaces
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Workspace"
+        "403":
+          description: Not admin
+
+  /api/admin/workspaces/{workspaceId}:
+    delete:
+      tags: [Admin]
+      summary: Delete a workspace and optionally PVC
+      operationId: adminDeleteWorkspace
+      parameters:
+        - name: workspaceId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: preserve_pvc
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "202":
+          description: Deletion accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "403":
+          description: Not admin
+
+  /api/admin/audit:
+    get:
+      tags: [Admin]
+      summary: Query audit events with pagination
+      operationId: adminListAudit
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+            maximum: 1000
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: event_type
+          in: query
+          schema:
+            type: string
+        - name: actor_user_id
+          in: query
+          schema:
+            type: string
+        - name: workspace_id
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated audit events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AuditEvent"
+                  total:
+                    type: integer
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+
+  /api/admin/users:
+    get:
+      tags: [Admin]
+      summary: List all users
+      operationId: adminListUsers
+      responses:
+        "200":
+          description: User list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/User"
+        "403":
+          description: Not admin
+
+  # ─── Audit ingestion (internal) ─────────────────────────────────
+
+  /api/audit:
+    post:
+      tags: [Admin]
+      summary: Record audit event from internal services
+      description: |
+        Accepts audit events from gateway, workspace-agent, and controller.
+        Auth: internal service token (X-Service-Auth), not browser session.
+        The control plane derives actor_user_id, workspace_id, and timestamp
+        — the caller may supply metadata but cannot forge identity.
+      operationId: recordAudit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuditEventIngest"
+      responses:
+        "201":
+          description: Recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+        "403":
+          description: Invalid service auth
+
+  # ─── Health ─────────────────────────────────────────────────────
+
+  /api/health:
+    get:
+      tags: [Admin]
+      summary: Health check (all services)
+      operationId: health
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                  service:
+                    type: string
+                    example: control-plane
+                  timestamp:
+                    type: string
+                    format: date-time
+
+  # ─── Gateway proxy routes (documentation only) ──────────────────
+
+  /ui/:
+    get:
+      tags: [Workspaces]
+      summary: Control-plane UI
+  /ui/login:
+    get:
+      tags: [Workspaces]
+      summary: Login page
+  /ui/workspaces:
+    get:
+      tags: [Workspaces]
+      summary: Workspace management UI
+
+  /workspace/chat/:
+    get:
+      tags: [Workspaces]
+      summary: Authenticated user's Paseo UI
+      description: |
+        Gateway behaviour:
+        1. Validate session cookie.
+        2. Resolve user → workspace record.
+        3. If hibernated: POST /api/workspaces/{id}/start, show
+           "starting" page with auto-refresh.
+        4. Wait up to 120s for workspace-agent /agent/ready.
+        5. Proxy to ws-<id>:6767.
+        - HTTP + WebSocket forwarding.
+        - Path prefix `/workspace/chat/` stripped before forwarding.
+        - Cache-Control: no-store.
+        - X-Forwarded-Host, X-Forwarded-Proto set.
+        - Long-lived connection timeout: 1h.
+        - On workspace failure: show error page, do not proxy.
+  /workspace/code/:
+    get:
+      tags: [Workspaces]
+      summary: Authenticated user's code-server
+      description: |
+        Gateway behaviour:
+        - Same session/resolve/wake flow as /workspace/chat/.
+        - Proxy to ws-<id>:8080.
+        - Path prefix `/workspace/code/` stripped before forwarding.
+        - code-server redirects rewritten to preserve prefix.
+        - WebSocket support for terminal and sync.
+        - Cache-Control: no-store.
+  /workspace/dev/:
+    get:
+      tags: [Workspaces]
+      summary: Registered dev-server proxy
+      description: |
+        Gateway behaviour:
+        - Validate session and resolve workspace.
+        - Look up registered exposure for requested port via
+          control-plane internal status or agent cache.
+        - Only ports in allowlist (3000, 4173, 5000, 5173, 8000, 8081)
+          AND actively registered via agent.
+        - Proxy to ws-<id>:9000/agent/exposures/{port}/proxy -> localhost:{port}
+        - Path prefix `/workspace/dev/` stripped.
+        - Cache-Control: no-store.
+        - Unregistered or unlisted port: 404.
+  /workspace/status/:
+    get:
+      tags: [Workspaces]
+      summary: User-safe workspace status JSON
+      description: |
+        Proxied to control-plane /api/workspaces/{id}/status.
+
+  # ─── Workspace Agent (per-pod, internal) ───────────────────────
+
+  /agent/health:
+    get:
+      tags: [Agent]
+      summary: Agent liveness
+      x-internal: true
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+
+  /agent/ready:
+    get:
+      tags: [Agent]
+      summary: Readiness — Paseo and code-server health
+      x-internal: true
+      responses:
+        "200":
+          description: All upstream services ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentReadiness"
+        "503":
+          description: One or more services not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentReadiness"
+
+  /agent/status:
+    get:
+      tags: [Agent]
+      summary: Full pod status
+      x-internal: true
+      responses:
+        "200":
+          description: Status payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentStatus"
+
+  /agent/activity:
+    post:
+      tags: [Agent]
+      summary: Heartbeat / activity timestamp
+      x-internal: true
+      responses:
+        "200":
+          description: Acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+
+  /agent/exposures:
+    get:
+      tags: [Agent]
+      summary: List currently registered port exposures
+      x-internal: true
+      responses:
+        "200":
+          description: Exposure list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Exposure"
+    post:
+      tags: [Agent]
+      summary: Register a dev-server port exposure
+      x-internal: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [port]
+              properties:
+                port:
+                  type: integer
+                  enum: [3000, 4173, 5000, 5173, 8000, 8081]
+                name:
+                  type: string
+                  example: frontend
+                protocol:
+                  type: string
+                  default: http
+                health_path:
+                  type: string
+                  default: /
+      responses:
+        "200":
+          description: Port registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Exposure"
+        "403":
+          description: Port not in allowlist
+        "409":
+          description: Port not listening on 127.0.0.1
+
+  /agent/exposures/{exposureId}:
+    delete:
+      tags: [Agent]
+      summary: Unregister a port exposure
+      x-internal: true
+      parameters:
+        - name: exposureId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Unregistered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+        "404":
+          description: Exposure not found
+
+components:
+  schemas:
+
+    # ─── Primitive ───────────────────────────────────────────────
+
+    Ok:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        correlation_id:
+          type: string
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        detail:
+          type: string
+        correlation_id:
+          type: string
+
+    # ─── Auth / Session ──────────────────────────────────────────
+
+    User:
+      type: object
+      required: [user_id, username, display_name, is_admin, created_at]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        display_name:
+          type: string
+        is_admin:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        disabled_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    Session:
+      type: object
+      required: [user_id, username, display_name, is_admin]
+      properties:
+        user_id:
+          type: string
+        username:
+          type: string
+        display_name:
+          type: string
+        is_admin:
+          type: boolean
+        session_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+
+    LoginResponse:
+      type: object
+      required: [user_id, username, display_name, is_admin]
+      properties:
+        user_id:
+          type: string
+        username:
+          type: string
+        display_name:
+          type: string
+        is_admin:
+          type: boolean
+        redirect:
+          type: string
+          example: /ui/workspaces
+
+    # ─── Workspace ───────────────────────────────────────────────
+
+    Workspace:
+      type: object
+      required: [workspace_id, user_id, state, created_at]
+      properties:
+        workspace_id:
+          type: string
+          example: ws-alice
+        user_id:
+          type: string
+        username:
+          type: string
+        state:
+          $ref: "#/components/schemas/WorkspaceState"
+        image:
+          type: string
+          example: localhost:5000/agent-workspace:git-6a6971c
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        last_activity_at:
+          type: string
+          format: date-time
+          nullable: true
+        idle_timeout_minutes:
+          type: integer
+          default: 15
+        exposures:
+          type: array
+          items:
+            $ref: "#/components/schemas/Exposure"
+
+    WorkspaceState:
+      type: string
+      enum:
+        - requested
+        - starting
+        - running
+        - idle_pending
+        - hibernating
+        - hibernated
+        - failed
+        - deleting
+        - deleted
+      description: |
+        Allowed transitions:
+        requested    → starting | deleting
+        starting     → running | failed | deleting
+        running      → idle_pending | hibernating | failed | deleting
+        idle_pending → running | hibernating | failed
+        hibernating  → hibernated | failed
+        hibernated   → starting | deleting
+        failed       → starting | deleting
+        deleting     → deleted | failed
+        deleted      → terminal
+
+    # ─── Status (user-safe) ──────────────────────────────────────
+
+    WorkspaceStatus:
+      type: object
+      properties:
+        workspace_id:
+          type: string
+        state:
+          $ref: "#/components/schemas/WorkspaceState"
+        services:
+          type: object
+          properties:
+            paseo:
+              type: string
+              enum: [starting, ready, unreachable]
+            code_server:
+              type: string
+              enum: [starting, ready, unreachable]
+        exposures:
+          type: array
+          items:
+            $ref: "#/components/schemas/Exposure"
+        last_activity_at:
+          type: string
+          format: date-time
+          nullable: true
+        error_message:
+          type: string
+          nullable: true
+
+    # ─── Routing status (internal — gateway use) ─────────────────
+
+    WorkspaceRoutingStatus:
+      type: object
+      properties:
+        workspace_id:
+          type: string
+        state:
+          $ref: "#/components/schemas/WorkspaceState"
+        cluster_ip:
+          type: string
+          nullable: true
+        ports:
+          type: object
+          properties:
+            paseo:
+              type: integer
+              default: 6767
+            code_server:
+              type: integer
+              default: 8080
+            agent:
+              type: integer
+              default: 9000
+        agent_ready:
+          type: boolean
+        exposures:
+          type: array
+          items:
+            $ref: "#/components/schemas/Exposure"
+
+    # ─── Operation (async) ───────────────────────────────────────
+
+    Operation:
+      type: object
+      required: [workspace_id, state, operation_id, requested_at]
+      properties:
+        workspace_id:
+          type: string
+        state:
+          $ref: "#/components/schemas/WorkspaceState"
+        operation_id:
+          type: string
+          format: uuid
+        requested_at:
+          type: string
+          format: date-time
+        correlation_id:
+          type: string
+
+    # ─── Agent ───────────────────────────────────────────────────
+
+    AgentReadiness:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [starting, ready]
+        services:
+          type: object
+          properties:
+            paseo:
+              type: string
+              enum: [starting, ready, unreachable]
+            code-server:
+              type: string
+              enum: [starting, ready, unreachable]
+
+    AgentStatus:
+      type: object
+      properties:
+        workspace:
+          type: string
+          example: /workspace
+        exposures:
+          type: array
+          items:
+            $ref: "#/components/schemas/Exposure"
+        uptime:
+          type: number
+
+    Exposure:
+      type: object
+      required: [port, name, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        port:
+          type: integer
+        name:
+          type: string
+          example: frontend
+        protocol:
+          type: string
+          default: http
+        health_path:
+          type: string
+          default: /
+        status:
+          type: string
+          enum: [registered, listening, error]
+        registered_at:
+          type: string
+          format: date-time
+
+    # ─── Audit ───────────────────────────────────────────────────
+
+    AuditEventIngest:
+      type: object
+      description: |
+        Submitted by gateway and workspace-agent.
+        The control plane derives actor_user_id and workspace_id
+        from the calling service's identity and auth context.
+        The caller supplies event_type and metadata only.
+      required: [event_type]
+      properties:
+        event_type:
+          $ref: "#/components/schemas/AuditEventType"
+        metadata:
+          type: object
+          additionalProperties: true
+
+    AuditEvent:
+      type: object
+      required: [timestamp, event_type, actor_user_id]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        event_type:
+          $ref: "#/components/schemas/AuditEventType"
+        actor_user_id:
+          type: string
+        workspace_id:
+          type: string
+          nullable: true
+        request_id:
+          type: string
+        correlation_id:
+          type: string
+        source_ip:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+
+    AuditEventType:
+      type: string
+      enum:
+        - auth.login_succeeded
+        - auth.login_failed
+        - auth.logout
+        - workspace.created
+        - workspace.start_requested
+        - workspace.started
+        - workspace.ready
+        - workspace.hibernate_requested
+        - workspace.hibernated
+        - workspace.failed
+        - workspace.deleted
+        - gateway.route_granted
+        - gateway.route_denied
+        - omp.run_started
+        - omp.run_completed
+        - omp.run_failed
+        - omp.run_cancelled
+        - omp.tool_invoked
+        - omp.tool_completed
+        - dev_server.registered
+        - dev_server.unregistered
+        - dev_server.route_granted
+        - dev_server.route_denied
+        - admin.action
+
+  # ─── Security ──────────────────────────────────────────────────
+
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: session
+      description: Browser session cookie (set by login)
+    internalServiceToken:
+      type: apiKey
+      in: header
+      name: X-Service-Auth
+      description: |
+        Service-to-service bearer token.
+        Gateway, workspace-agent, and controller each have
+        a scoped token that identifies their service identity
+        and (for the agent) authorized workspace scope.
+        Used for audit ingestion and internal status lookups.
+
+security:
+  - sessionCookie: []

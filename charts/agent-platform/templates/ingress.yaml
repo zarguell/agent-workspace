@@ -1,0 +1,74 @@
+---
+# Main domain ingress — routes everything to gateway
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: main-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: agent-platform
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: {{ .Values.baseDomain | quote }}
+      http:
+        paths:
+          # Root -> gateway (root_redirect: workspaces if logged in, login if not)
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 80
+          # API routes -> gateway (gateway proxies to control-plane)
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 80
+          # UI routes -> gateway (gateway serves directly or proxies)
+          - path: /ui
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 80
+          # Workspace routes -> gateway (gateway proxies to workspace pods)
+          - path: /workspace
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 80
+          # Canvas UI -> gateway (proxies to workspace Agent Canvas)
+          - path: /canvas
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 80
+          # Code-server -> gateway (proxies to workspace code-server)
+          - path: /code
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 80
+          # Paseo chat -> gateway (proxies to workspace Paseo)
+          - path: /chat
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 80

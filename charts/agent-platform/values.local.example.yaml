@@ -1,0 +1,61 @@
+# Local deployment overrides for agent-platform Helm chart.
+#
+# Copy this file to values.local.yaml (gitignored via *.local.yaml)
+# and fill in your secrets. Then:
+#   helm install agent-platform charts/agent-platform -f values.local.yaml
+#
+# Images are expected to be built and pushed to the local registry
+# before deploying (see scripts/build-images.sh or docker compose).
+
+baseDomain: example.com
+
+images:
+  controlPlane: localhost:5000/agent-control-plane
+  gateway: localhost:5000/agent-gateway
+  workspace: localhost:5000/agent-workspace
+  tag: dev
+
+postgres:
+  user: agentplatform
+  password: "CHANGE_ME"                # ⚠ set a strong password
+  database: agentplatform
+  storage: 10Gi
+  storageClass: local-path
+
+serviceAuthToken: "CHANGE_ME"          # ⚠ shared secret between gateway and control-plane
+
+idleTimeoutMinutes: 15                 # workspace hibernation after N min idle
+
+# Pod resource requests/limits — tune for your hardware
+resources:
+  controlPlane:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1
+      memory: 2Gi
+  gateway:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1
+      memory: 2Gi
+  postgres:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1
+      memory: 2Gi
+
+workspaceDefaults:
+  storageSize: 10Gi
+  storageClass: local-path
+  resourceRequests:
+    cpu: 512m
+    memory: 1Gi
+  resourceLimits:
+    cpu: 2
+    memory: 4Gi

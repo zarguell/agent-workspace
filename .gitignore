@@ -1,0 +1,33 @@
+# Secrets
+values.local.yaml
+*.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Node
+node_modules/
+.npm/
+
+# macOS
+.DS_Store
+*.swp
+*.swo
+
+# Build artifacts
+services/workspace/code-server.deb
+services/workspace/omp-linux-x64
+services/workspace/uv.tar.gz
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log

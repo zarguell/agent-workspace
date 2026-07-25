@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: gateway
+      containers:
+        - name: gateway
+          image: "{{ .Values.images.gateway }}:{{ .Values.images.tag }}"
+          ports:
+            - containerPort: 80
+              protocol: TCP
+              name: http
+          env:
+            - name: CONTROL_PLANE_URL
+              value: "http://control-plane:80"
+            - name: SERVICE_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: service-auth-secret
+                  key: token
+          resources:
+            requests:
+              cpu: {{ .Values.resources.gateway.requests.cpu }}
+              memory: {{ .Values.resources.gateway.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.gateway.limits.cpu }}
+              memory: {{ .Values.resources.gateway.limits.memory }}

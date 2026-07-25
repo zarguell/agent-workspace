@@ -1,0 +1,6 @@
+apiVersion: v2
+name: agent-platform
+description: Helm chart for the Agent Workspace platform (control-plane, gateway, postgres, Traefik Gateway API)
+type: application
+version: 0.1.0
+appVersion: "dev-latest"

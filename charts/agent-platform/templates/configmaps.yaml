@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: control-plane-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  idle_timeout_minutes: {{ .Values.idleTimeoutMinutes | quote }}
+  workspace_image: "{{ .Values.images.workspace }}:{{ .Values.images.tag }}"
+  workspace_defaults.json: |-
+{{ .Values.workspaceDefaults | toYaml | indent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  control_plane_url: "http://control-plane:80"
