@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: platform-quota
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  # Default-deny ceilings for the agent-platform namespace. These MUST stay >=
+  # the deployments' combined limits plus headroom (3 CPU / 6Gi), and >=
+  # postgres.storage (10Gi PVC), or pods fail to schedule and the postgres PVC
+  # fails to create. Values come from resources.platformNamespace.quota.
+  hard:
+    cpu: {{ .Values.resources.platformNamespace.quota.cpu }}
+    memory: {{ .Values.resources.platformNamespace.quota.memory }}
+    requests.storage: {{ .Values.resources.platformNamespace.quota.storage }}

@@ -30,7 +30,7 @@ spec:
             - name: POSTGRES_USER
               value: {{ .Values.postgres.user | quote }}
             - name: POSTGRES_PASSWORD
-              value: {{ .Values.postgres.password | quote }}
+              value: {{ required "postgres.password must be set" .Values.postgres.password | quote }}
             - name: POSTGRES_DB
               value: {{ .Values.postgres.database | quote }}
           resources:

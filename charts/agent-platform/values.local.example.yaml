@@ -15,6 +15,13 @@ images:
   workspace: localhost:5000/agent-workspace
   tag: dev
 
+network:
+  # Namespaces allowed to reach the gateway directly (allow-to-gateway
+  # NetworkPolicy). Traefik runs in kube-system on stock k3s; override if
+  # your ingress controller is deployed elsewhere.
+  ingressControllerNamespaces:
+    - kube-system
+
 postgres:
   user: agentplatform
   password: "CHANGE_ME"                # ⚠ set a strong password
@@ -23,6 +30,8 @@ postgres:
   storageClass: local-path
 
 serviceAuthToken: "CHANGE_ME"          # ⚠ shared secret between gateway and control-plane
+
+seedAdminPassword: "CHANGE_ME"         # ⚠ initial admin password (first boot only)
 
 idleTimeoutMinutes: 15                 # workspace hibernation after N min idle
 
@@ -52,6 +61,15 @@ resources:
     limits:
       cpu: 1
       memory: 2Gi
+
+  # Namespace-wide ResourceQuota ceilings (default-deny). Keep these >= the
+  # sum of the deployment limits above + headroom (and >= postgres.storage)
+  # or pods/PVCs will fail to schedule/create.
+  platformNamespace:
+    quota:
+      cpu: 4500m
+      memory: 9Gi
+      storage: 12Gi
 
 workspaceDefaults:
   storageSize: 10Gi

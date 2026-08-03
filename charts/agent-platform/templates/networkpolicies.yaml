@@ -17,6 +17,10 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/instance: {{ .Release.Name }}
+  # Ingress peers: per-user workspace pods (namespaces labeled workspace=true,
+  # set by the reconciler at creation) and the ingress controller (Traefik;
+  # kube-system on stock k3s, see network.ingressControllerNamespaces).
+  # Nothing else may reach the gateway.
 spec:
   podSelector:
     matchLabels:
@@ -25,7 +29,16 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    - ports:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              workspace: "true"
+        {{- range .Values.network.ingressControllerNamespaces }}
+        - namespaceSelector:
+            matchNames:
+              - {{ . | quote }}
+        {{- end }}
+      ports:
         - port: 80
           protocol: TCP
 ---
@@ -49,6 +62,33 @@ spec:
             matchLabels:
               app.kubernetes.io/name: gateway
               app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - port: 80
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-control-plane-from-workspaces
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  # Workspace agents report usage to the control plane (POST
+  # /api/internal/usage) from per-user namespaces. The reconciler labels
+  # each per-user namespace workspace=true at creation, so this admits
+  # workspace pods only — not arbitrary traffic.
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              workspace: "true"
       ports:
         - port: 80
           protocol: TCP

@@ -5,9 +5,18 @@ images:
   gateway: localhost:5000/agent-gateway
   tag: dev-latest
   workspace: localhost:5000/agent-workspace
+network:
+  # Namespaces whose pods may reach the gateway directly (NetworkPolicy
+  # allow-to-gateway). Per-user workspace pods (namespaces labeled
+  # workspace=true, set by the reconciler at namespace creation) are always
+  # admitted. The ingress controller must also reach the gateway: this chart's
+  # Ingress uses ingressClassName: traefik, and on stock k3s the bundled
+  # Traefik runs in kube-system. Override if Traefik is deployed elsewhere.
+  ingressControllerNamespaces:
+    - kube-system
 postgres:
   database: agentplatform
-  password: changeme
+  # password: REQUIRED - no default; set via values.local.yaml (postgres.password)
   storage: 10Gi
   storageClass: local-path
   user: agentplatform
@@ -33,7 +42,22 @@ resources:
     requests:
       cpu: 250m
       memory: 512Mi
-serviceAuthToken: dev-service-token-123
+  # Hard ResourceQuota ceilings (default-deny) for the agent-platform
+  # namespace. A pod that would push the namespace past these fails to
+  # schedule; a PVC whose request exceeds requests.storage fails to create.
+  # MUST stay >= the deployments' combined limits below plus headroom: the
+  # three deployments (controlPlane, gateway, postgres) sum to 3 CPU / 6Gi of
+  # limits, and postgres requests a 10Gi PVC. Defaults add ~50% headroom to
+  # the CPU/memory sum and 2Gi to postgres.storage. If you raise the
+  # resources.* limits or postgres.storage, raise these too.
+  platformNamespace:
+    quota:
+      cpu: 4500m
+      memory: 9Gi
+      storage: 12Gi
+# serviceAuthToken: REQUIRED - no default; set via values.local.yaml
+# seedAdminPassword: REQUIRED - no default; set via values.local.yaml (used
+# only when the control plane seeds the initial admin on an empty users table)
 tls:
   # Serve HTTPS via the Traefik websecure entrypoint.
   # Local self-signed: run scripts/generate-selfsigned-cert.sh, then set enabled: true.

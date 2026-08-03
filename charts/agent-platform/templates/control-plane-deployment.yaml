@@ -37,14 +37,19 @@ spec:
                 secretKeyRef:
                   name: service-auth-secret
                   key: token
+            - name: SEED_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: seed-admin-secret
+                  key: password
             - name: COOKIE_DOMAIN
               value: {{ printf ".%s" .Values.baseDomain | quote }}
             - name: WORKSPACE_IMAGE
               value: "{{ .Values.images.workspace }}:{{ .Values.images.tag }}"
             - name: PASEO_PASSWORD
+              value: "{{ .Values.workspaceDefaults.paseoPassword | default (uuidv4) }}"
             - name: ANTHROPIC_API_KEY
               value: "{{ .Values.anthropicApiKey }}"
-              value: "{{ .Values.workspaceDefaults.paseoPassword | default (uuidv4) }}"
           resources:
             requests:
               cpu: {{ .Values.resources.controlPlane.requests.cpu }}
