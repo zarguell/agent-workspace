@@ -19,15 +19,18 @@ class IdempotencyStore:
     def __init__(self):
         self._store: dict[str, tuple[int, int, str]] = {}  # key -> (expires_at, status, body)
 
-    def _make_key(self, idempotency_key: str, endpoint: str, workspace_id: str, body: Optional[bytes]) -> str:
-        body_hash = hashlib.sha256(body or b"").hexdigest() if body else "none"
-        raw = f"{idempotency_key}|{endpoint}|{workspace_id}|{body_hash}"
-        return hashlib.sha256(raw.encode()).hexdigest()
-
     def _make_lookup_key(self, idempotency_key: str, endpoint: str, workspace_id: str) -> str:
-        """Key for looking up existing entries (ignoring body hash)."""
-        raw = f"{idempotency_key}|{endpoint}|{workspace_id}|"
+        """Stable prefix shared by every entry with this (key, endpoint, ws).
+
+        Entries are stored under ``lookup_prefix + body_fingerprint`` so
+        ``check_conflict`` can find siblings by prefix match.
+        """
+        raw = f"{idempotency_key}|{endpoint}|{workspace_id}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def _make_key(self, idempotency_key: str, endpoint: str, workspace_id: str, body: Optional[bytes]) -> str:
+        body_hash = hashlib.sha256(body or b"").hexdigest()[:16] if body else "none"
+        return f"{self._make_lookup_key(idempotency_key, endpoint, workspace_id)}{body_hash}"
 
     def get(self, idempotency_key: str, endpoint: str, workspace_id: str, body: Optional[bytes]) -> Optional[tuple[int, str]]:
         """Return (status, response_body) if a matching idempotent result exists, else None."""

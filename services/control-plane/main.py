@@ -420,7 +420,7 @@ async def start_workspace(request: Request, workspace_id: str):
         # No-op if already running or starting
         if ws.state in ("running", "starting"):
             out = await _workspace_to_out(ws, db)
-            resp = JSONResponse(status_code=200, content=out.model_dump())
+            resp = JSONResponse(status_code=200, content=out.model_dump(mode="json"))
             if idempotency_key:
                 idempotency_store.set(idempotency_key, endpoint, workspace_id, body, 200, resp.body.decode())
             return resp
@@ -455,7 +455,7 @@ async def start_workspace(request: Request, workspace_id: str):
             requested_at=now,
             correlation_id=_get_correlation_id(request) or None,
         )
-        resp = JSONResponse(status_code=202, content=result.model_dump())
+        resp = JSONResponse(status_code=202, content=result.model_dump(mode="json"))
         if idempotency_key:
             idempotency_store.set(idempotency_key, endpoint, workspace_id, body, 202, resp.body.decode())
         return resp
@@ -507,7 +507,7 @@ async def hibernate_workspace(request: Request, workspace_id: str):
             requested_at=now,
             correlation_id=_get_correlation_id(request) or None,
         )
-        resp = JSONResponse(status_code=202, content=result.model_dump())
+        resp = JSONResponse(status_code=202, content=result.model_dump(mode="json"))
         if idempotency_key:
             idempotency_store.set(idempotency_key, endpoint, workspace_id, body, 202, resp.body.decode())
         return resp

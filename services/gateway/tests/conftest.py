@@ -1,0 +1,134 @@
+"""Test fixtures for the gateway suite — the control plane is fully mocked.
+
+Two things need the mock: the module-global ``main.http_client`` (used by
+validate_session / get_routing_status / trigger_start / record_audit) and
+every fresh ``httpx.AsyncClient()`` the gateway constructs inline
+(path_proxy, login_proxy, api_proxy, _proxy_paseo). The app fixture patches
+``main.httpx.AsyncClient`` with a factory that returns a MockTransport-backed
+client for no-arg construction and delegates to the real class when a
+transport is supplied (so the test client itself is unaffected).
+
+``os.chdir`` to the service dir is required: main.py loads templates from
+the relative path "templates".
+"""
+
+import os
+import sys
+from pathlib import Path
+
+SRV = Path(__file__).resolve().parent.parent
+os.chdir(SRV)
+sys.path.insert(0, str(SRV))
+
+os.environ.setdefault("SERVICE_AUTH_TOKEN", "test-token")
+os.environ.setdefault("CONTROL_PLANE_URL", "http://control-plane:80")
+
+import httpx
+import pytest
+import pytest_asyncio
+
+CP = "http://control-plane:80"
+CLUSTER_IP = "10.0.0.5"
+GOOD_COOKIE = "good-cookie"
+
+UPSTREAM_HTML = (
+    '<!DOCTYPE html><html><head><title>Canvas</title></head>'
+    '<body><script src="/assets/app.js"></script></body></html>'
+)
+
+# Mutable per-test state read by the mock handler.
+_requests_log: list = []
+_routing_config = {"state": "running", "agent_ready": True, "cluster_ip": CLUSTER_IP}
+
+
+def _handler(request: httpx.Request) -> httpx.Response:
+    _requests_log.append(request)
+    url = request.url
+
+    if url.host == "control-plane":
+        path = url.path
+        if request.method == "GET" and path == "/api/session":
+            cookie = request.headers.get("cookie", "")
+            if f"session={GOOD_COOKIE}" in cookie:
+                return httpx.Response(200, json={
+                    "user_id": "u-alice",
+                    "username": "alice",
+                    "display_name": "Alice",
+                    "is_admin": True,
+                })
+            return httpx.Response(401, json={"error": "No valid session"})
+        if request.method == "GET" and path.startswith("/api/internal/workspaces/") and path.endswith("/routing"):
+            ws_id = path.split("/")[4]
+            return httpx.Response(200, json={
+                "workspace_id": ws_id,
+                "state": _routing_config["state"],
+                "cluster_ip": _routing_config["cluster_ip"],
+                "agent_ready": _routing_config["agent_ready"],
+                "exposures": [],
+            })
+        if request.method == "POST" and path.startswith("/api/workspaces/") and path.endswith("/start"):
+            return httpx.Response(202, json={
+                "workspace_id": path.split("/")[3],
+                "state": "starting",
+            })
+        if request.method == "POST" and path == "/api/audit":
+            return httpx.Response(201, json={"ok": True})
+        return httpx.Response(404, json={"error": "not found"})
+
+    if url.host == CLUSTER_IP:
+        return httpx.Response(200, text=UPSTREAM_HTML, headers={"content-type": "text/html"})
+
+    return httpx.Response(404, json={"error": "not found"})
+
+
+@pytest.fixture(autouse=True)
+def _reset_mocks():
+    _requests_log.clear()
+    _routing_config.update(state="running", agent_ready=True, cluster_ip=CLUSTER_IP)
+    yield
+    _requests_log.clear()
+
+
+@pytest.fixture
+def routing_config():
+    return _routing_config
+
+
+@pytest.fixture
+def requests_log():
+    return _requests_log
+
+
+
+@pytest_asyncio.fixture
+async def valid_cookie(client):
+    """Set the known-good session cookie on the client."""
+    client.cookies.set("session", GOOD_COOKIE)
+    return client.cookies
+
+@pytest_asyncio.fixture
+async def app(monkeypatch):
+    import main
+
+    real_ac = httpx.AsyncClient
+
+    def _factory(*args, **kwargs):
+        # The gateway constructs httpx.AsyncClient() with no args; the test
+        # client passes transport= explicitly and must stay on the real class.
+        if args or kwargs.get("transport"):
+            return real_ac(*args, **kwargs)
+        return real_ac(transport=httpx.MockTransport(_handler))
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", _factory)
+    main.http_client = real_ac(transport=httpx.MockTransport(_handler))
+    try:
+        yield main.app
+    finally:
+        await main.http_client.aclose()
+
+
+@pytest_asyncio.fixture
+async def client(app):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://agents.local.test") as c:
+        yield c

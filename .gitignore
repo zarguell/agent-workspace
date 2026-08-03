@@ -6,6 +6,7 @@ values.local.yaml
 # Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
 *.egg-info/
 .venv/
 venv/
