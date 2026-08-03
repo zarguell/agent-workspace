@@ -110,3 +110,69 @@ class AuditEvent(Base):
     correlation_id = Column(String(255), nullable=True)
     source_ip = Column(String(45), nullable=True)
     metadata_ = Column("metadata", JSONB, nullable=True)
+
+
+class Group(Base):
+    """A named collection of users; workspaces can be shared with a group."""
+
+    __tablename__ = "groups"
+
+    group_id = Column(String(255), primary_key=True)  # grp-<uuid>
+    name = Column(String(255), unique=True, nullable=False, index=True)
+    created_by = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+    members = relationship(
+        "GroupMember",
+        back_populates="group",
+        cascade="all, delete-orphan",
+    )
+
+
+class GroupMember(Base):
+    """Membership of a user in a group, with a role."""
+
+    __tablename__ = "group_members"
+
+    group_id = Column(
+        String(255),
+        ForeignKey("groups.group_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    role = Column(String(20), nullable=False, default="member")  # admin | member
+    joined_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+    group = relationship("Group", back_populates="members")
+
+
+class WorkspaceShare(Base):
+    """Grant of a permission on a workspace to a group."""
+
+    __tablename__ = "workspace_shares"
+
+    workspace_id = Column(
+        String(255),
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    group_id = Column(
+        String(255),
+        ForeignKey("groups.group_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    permission = Column(String(20), nullable=False, default="view")  # view | operate
+    created_by = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)

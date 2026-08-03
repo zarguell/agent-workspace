@@ -40,6 +40,17 @@ UPSTREAM_HTML = (
 _requests_log: list = []
 _routing_config = {"state": "running", "agent_ready": True, "cluster_ip": CLUSTER_IP}
 
+# Session cookie marker → session dict.
+_SESSIONS = {
+    f"session={GOOD_COOKIE}": {"user_id": "u-alice", "username": "alice", "display_name": "Alice", "is_admin": True},
+    "session=bob-cookie": {"user_id": "u-bob", "username": "bob", "display_name": "Bob", "is_admin": False},
+    "session=eve-cookie": {"user_id": "u-eve", "username": "eve", "display_name": "Eve", "is_admin": False},
+}
+
+# Workspace → users allowed to route to it (mirrors the control plane:
+# owner alice + bob who holds an operate share on ws-alice).
+_ROUTING_ACL = {"ws-alice": {"alice", "bob"}}
+
 
 def _handler(request: httpx.Request) -> httpx.Response:
     _requests_log.append(request)
@@ -49,16 +60,15 @@ def _handler(request: httpx.Request) -> httpx.Response:
         path = url.path
         if request.method == "GET" and path == "/api/session":
             cookie = request.headers.get("cookie", "")
-            if f"session={GOOD_COOKIE}" in cookie:
-                return httpx.Response(200, json={
-                    "user_id": "u-alice",
-                    "username": "alice",
-                    "display_name": "Alice",
-                    "is_admin": True,
-                })
+            for marker, session in _SESSIONS.items():
+                if marker in cookie:
+                    return httpx.Response(200, json=session)
             return httpx.Response(401, json={"error": "No valid session"})
         if request.method == "GET" and path.startswith("/api/internal/workspaces/") and path.endswith("/routing"):
             ws_id = path.split("/")[4]
+            service_user = request.headers.get("x-service-user", "")
+            if service_user not in _ROUTING_ACL.get(ws_id, set()):
+                return httpx.Response(404, json={"error": "Not found"})
             return httpx.Response(200, json={
                 "workspace_id": ws_id,
                 "state": _routing_config["state"],
@@ -99,12 +109,12 @@ def requests_log():
     return _requests_log
 
 
-
 @pytest_asyncio.fixture
 async def valid_cookie(client):
     """Set the known-good session cookie on the client."""
     client.cookies.set("session", GOOD_COOKIE)
     return client.cookies
+
 
 @pytest_asyncio.fixture
 async def app(monkeypatch):

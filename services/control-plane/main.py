@@ -29,18 +29,24 @@ from auth import (
 )
 from database import async_session_factory, get_session, init_db
 from idempotency import idempotency_store
-from models import AuditEvent, Session, User, Workspace
+from models import AuditEvent, Group, GroupMember, Session, User, Workspace, WorkspaceShare
 from reconciler import reconciler
 from schemas import (
+    AddMemberRequest,
     AuditEventOut,
     AuditPage,
+    CreateGroupRequest,
     Error,
+    GroupDetail,
+    GroupOut,
     HealthResponse,
     LoginRequest,
     LoginResponse,
     Ok,
     Operation,
     SessionOut,
+    ShareOut,
+    ShareRequest,
     WorkspaceOut,
     WorkspaceRoutingStatus,
     WorkspaceStatus,
@@ -229,13 +235,57 @@ def _check_admin(request: Request) -> bool:
 
 
 async def _get_workspace_for_user(request: Request, workspace_id: str, db: AsyncSession) -> Optional[Workspace]:
-    """Get workspace if it belongs to the current user or user is admin."""
+    """Get workspace if it belongs to the current user, user is admin,
+    or the user is a member of a group the workspace is shared with."""
     user_id = _get_user_id(request)
     is_admin = _check_admin(request)
-    query = select(Workspace).where(Workspace.workspace_id == workspace_id)
-    if not is_admin:
-        query = query.where(Workspace.user_id == user_id)
-    result = await db.execute(query)
+    result = await db.execute(select(Workspace).where(Workspace.workspace_id == workspace_id))
+    ws = result.scalar_one_or_none()
+    if ws is None:
+        return None
+    if is_admin or ws.user_id == user_id:
+        return ws
+    if await _user_has_share(db, user_id, workspace_id, "view"):
+        return ws
+    return None
+
+
+async def _user_has_share(db: AsyncSession, user_id: str, workspace_id: str, required: str) -> bool:
+    """True if *user_id* is a member of a group holding a share on the workspace.
+
+    ``required`` is "view" or "operate"; operate is a superset of view.
+    """
+    result = await db.execute(
+        select(WorkspaceShare.permission)
+        .join(GroupMember, GroupMember.group_id == WorkspaceShare.group_id)
+        .where(
+            GroupMember.user_id == user_id,
+            WorkspaceShare.workspace_id == workspace_id,
+        )
+    )
+    perms = result.scalars().all()
+    if required == "operate":
+        return any(p == "operate" for p in perms)
+    return any(p in ("view", "operate") for p in perms)
+
+
+async def _can_operate_workspace(request: Request, ws: Workspace, db: AsyncSession) -> bool:
+    """True if the caller may start/hibernate the workspace (owner, admin,
+    or member of a group with operate permission)."""
+    user_id = _get_user_id(request)
+    if _check_admin(request) or ws.user_id == user_id:
+        return True
+    return await _user_has_share(db, user_id, ws.workspace_id, "operate")
+
+
+async def _group_member_role(db: AsyncSession, group_id: str, user_id: str) -> Optional[str]:
+    """Return the caller's role in a group, or None if not a member."""
+    result = await db.execute(
+        select(GroupMember.role).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == user_id,
+        )
+    )
     return result.scalar_one_or_none()
 
 
@@ -369,15 +419,27 @@ async def get_session(request: Request):
 
 @app.get("/api/workspaces")
 async def list_workspaces(request: Request):
+    """List the caller's own workspace plus any shared with their groups."""
     user_id = _get_user_id(request)
     async with async_session_factory() as db:
         result = await db.execute(
             select(Workspace).where(Workspace.user_id == user_id)
         )
-        ws = result.scalar_one_or_none()
-        if ws is None:
-            return []
-        return [await _workspace_to_out(ws, db)]
+        workspaces = list(result.scalars().all())
+
+        shared = await db.execute(
+            select(Workspace)
+            .join(WorkspaceShare, WorkspaceShare.workspace_id == Workspace.workspace_id)
+            .join(GroupMember, GroupMember.group_id == WorkspaceShare.group_id)
+            .where(GroupMember.user_id == user_id)
+        )
+        seen = {w.workspace_id for w in workspaces}
+        for w in shared.scalars().all():
+            if w.workspace_id not in seen:
+                workspaces.append(w)
+                seen.add(w.workspace_id)
+
+        return [await _workspace_to_out(w, db) for w in workspaces]
 
 
 @app.get("/api/workspaces/{workspace_id}")
@@ -409,6 +471,10 @@ async def start_workspace(request: Request, workspace_id: str):
         ws = await _get_workspace_for_user(request, workspace_id, db)
         if ws is None:
             return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+
+        # View access is not enough — starting mutates the workspace.
+        if not await _can_operate_workspace(request, ws, db):
+            return JSONResponse(status_code=403, content=Error(error="Insufficient permission").model_dump())
 
         # Reject deleting/deleted
         if ws.state in ("deleting", "deleted"):
@@ -483,6 +549,10 @@ async def hibernate_workspace(request: Request, workspace_id: str):
         if ws.state not in ("running", "idle_pending", "hibernating"):
             return JSONResponse(status_code=409, content=Error(error=f"Cannot hibernate workspace in state '{ws.state}'").model_dump())
 
+        # View access is not enough — hibernating mutates the workspace.
+        if not await _can_operate_workspace(request, ws, db):
+            return JSONResponse(status_code=403, content=Error(error="Insufficient permission").model_dump())
+
         operation_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
         await db.execute(
@@ -548,13 +618,35 @@ async def get_workspace_status(request: Request, workspace_id: str):
 
 @app.get("/api/internal/workspaces/{workspace_id}/routing")
 async def get_workspace_routing(request: Request, workspace_id: str):
-    # X-Service-Auth already validated by middleware
+    """Return routing info for the gateway.
+
+    The gateway identifies the end user via X-Service-User; routing is only
+    granted to the workspace owner, admins, or members of a group holding
+    operate permission — anything else is a 404 (no existence leak).
+    """
+    service_user = request.headers.get("X-Service-User", "")
+    if not service_user:
+        return JSONResponse(status_code=401, content=Error(error="Missing X-Service-User").model_dump())
+
     async with async_session_factory() as db:
         result = await db.execute(
             select(Workspace).where(Workspace.workspace_id == workspace_id)
         )
         ws = result.scalar_one_or_none()
         if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+
+        user_result = await db.execute(select(User).where(User.username == service_user))
+        user = user_result.scalar_one_or_none()
+        if user is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+
+        allowed = (
+            user.is_admin
+            or ws.user_id == user.user_id
+            or await _user_has_share(db, user.user_id, workspace_id, "operate")
+        )
+        if not allowed:
             return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
 
         cluster_ip = await reconciler._get_cluster_ip(ws.user_id)
@@ -692,6 +784,267 @@ async def admin_list_users(request: Request):
             }
             for u in users
         ]
+
+
+# ─── Group endpoints ─────────────────────────────────────────────────
+
+@app.post("/api/groups", status_code=201)
+async def create_group(request: Request):
+    body = await request.json()
+    data = CreateGroupRequest(**body)
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        result = await db.execute(select(Group).where(Group.name == data.name))
+        if result.scalar_one_or_none() is not None:
+            return JSONResponse(status_code=409, content=Error(error="Group name already exists").model_dump())
+
+        group_id = f"grp-{uuid.uuid4()}"
+        group = Group(group_id=group_id, name=data.name, created_by=user_id)
+        db.add(group)
+        db.add(GroupMember(group_id=group_id, user_id=user_id, role="admin"))
+        await record_audit_event(
+            db, "group.created",
+            actor_user_id=user_id,
+            request_id=_get_request_id(request),
+            correlation_id=_get_correlation_id(request),
+            source_ip=_get_source_ip(request),
+            metadata={"group_id": group_id, "name": data.name},
+        )
+        await db.commit()
+        return GroupOut(group_id=group_id, name=group.name, created_at=group.created_at, role="admin").model_dump()
+
+
+@app.get("/api/groups")
+async def list_groups(request: Request):
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(Group, GroupMember.role)
+            .join(GroupMember, GroupMember.group_id == Group.group_id)
+            .where(GroupMember.user_id == user_id)
+            .order_by(Group.created_at.desc())
+        )
+        return [
+            GroupOut(group_id=g.group_id, name=g.name, created_at=g.created_at, role=role).model_dump()
+            for g, role in result.all()
+        ]
+
+
+@app.get("/api/groups/{group_id}")
+async def get_group(request: Request, group_id: str):
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        group = await db.get(Group, group_id)
+        if group is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if await _group_member_role(db, group_id, user_id) is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+
+        members_result = await db.execute(
+            select(GroupMember, User.username, User.display_name)
+            .join(User, User.user_id == GroupMember.user_id)
+            .where(GroupMember.group_id == group_id)
+            .order_by(GroupMember.joined_at)
+        )
+        members = [
+            {
+                "user_id": m.user_id,
+                "username": username,
+                "display_name": display_name,
+                "role": m.role,
+                "joined_at": m.joined_at,
+            }
+            for m, username, display_name in members_result.all()
+        ]
+        return GroupDetail(
+            group_id=group.group_id,
+            name=group.name,
+            created_at=group.created_at,
+            members=members,
+        ).model_dump()
+
+
+@app.post("/api/groups/{group_id}/members", status_code=201)
+async def add_group_member(request: Request, group_id: str):
+    body = await request.json()
+    data = AddMemberRequest(**body)
+    user_id = _get_user_id(request)
+    role = data.role if data.role in ("admin", "member") else "member"
+    async with async_session_factory() as db:
+        group = await db.get(Group, group_id)
+        if group is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if await _group_member_role(db, group_id, user_id) != "admin":
+            return JSONResponse(status_code=403, content=Error(error="Group admin only").model_dump())
+
+        user_result = await db.execute(select(User).where(User.username == data.username))
+        user = user_result.scalar_one_or_none()
+        if user is None:
+            return JSONResponse(status_code=404, content=Error(error="User not found").model_dump())
+        if await _group_member_role(db, group_id, user.user_id) is not None:
+            return JSONResponse(status_code=409, content=Error(error="User is already a member").model_dump())
+
+        db.add(GroupMember(group_id=group_id, user_id=user.user_id, role=role))
+        await record_audit_event(
+            db, "group.member_added",
+            actor_user_id=user_id,
+            request_id=_get_request_id(request),
+            correlation_id=_get_correlation_id(request),
+            source_ip=_get_source_ip(request),
+            metadata={"group_id": group_id, "username": data.username, "role": role},
+        )
+        await db.commit()
+        return {"group_id": group_id, "user_id": user.user_id, "username": user.username, "role": role}
+
+
+@app.delete("/api/groups/{group_id}/members/{member_user_id}")
+async def remove_group_member(request: Request, group_id: str, member_user_id: str):
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        group = await db.get(Group, group_id)
+        if group is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if await _group_member_role(db, group_id, user_id) != "admin":
+            return JSONResponse(status_code=403, content=Error(error="Group admin only").model_dump())
+
+        membership = await db.get(GroupMember, {"group_id": group_id, "user_id": member_user_id})
+        if membership is None:
+            return JSONResponse(status_code=404, content=Error(error="Not a member").model_dump())
+        await db.delete(membership)
+        await record_audit_event(
+            db, "group.member_removed",
+            actor_user_id=user_id,
+            request_id=_get_request_id(request),
+            correlation_id=_get_correlation_id(request),
+            source_ip=_get_source_ip(request),
+            metadata={"group_id": group_id, "member_user_id": member_user_id},
+        )
+        await db.commit()
+        return Ok().model_dump()
+
+
+@app.delete("/api/groups/{group_id}")
+async def delete_group(request: Request, group_id: str):
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        group = await db.get(Group, group_id)
+        if group is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if await _group_member_role(db, group_id, user_id) != "admin":
+            return JSONResponse(status_code=403, content=Error(error="Group admin only").model_dump())
+
+        await db.delete(group)
+        await record_audit_event(
+            db, "group.deleted",
+            actor_user_id=user_id,
+            request_id=_get_request_id(request),
+            correlation_id=_get_correlation_id(request),
+            source_ip=_get_source_ip(request),
+            metadata={"group_id": group_id, "name": group.name},
+        )
+        await db.commit()
+        return Ok().model_dump()
+
+
+# ─── Workspace sharing endpoints ─────────────────────────────────────
+
+@app.post("/api/workspaces/{workspace_id}/shares", status_code=201)
+async def share_workspace(request: Request, workspace_id: str):
+    body = await request.json()
+    data = ShareRequest(**body)
+    user_id = _get_user_id(request)
+    permission = data.permission if data.permission in ("view", "operate") else "view"
+    async with async_session_factory() as db:
+        ws = await db.get(Workspace, workspace_id)
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if not (_check_admin(request) or ws.user_id == user_id):
+            return JSONResponse(status_code=403, content=Error(error="Workspace owner only").model_dump())
+
+        group = await db.get(Group, data.group_id)
+        if group is None:
+            return JSONResponse(status_code=404, content=Error(error="Group not found").model_dump())
+        existing = await db.get(WorkspaceShare, {"workspace_id": workspace_id, "group_id": data.group_id})
+        if existing is not None:
+            return JSONResponse(status_code=409, content=Error(error="Workspace already shared with this group").model_dump())
+
+        db.add(WorkspaceShare(
+            workspace_id=workspace_id,
+            group_id=data.group_id,
+            permission=permission,
+            created_by=user_id,
+        ))
+        await record_audit_event(
+            db, "workspace.shared",
+            actor_user_id=user_id,
+            workspace_id=workspace_id,
+            request_id=_get_request_id(request),
+            correlation_id=_get_correlation_id(request),
+            source_ip=_get_source_ip(request),
+            metadata={"group_id": data.group_id, "permission": permission},
+        )
+        await db.commit()
+        return ShareOut(
+            workspace_id=workspace_id,
+            group_id=data.group_id,
+            group_name=group.name,
+            permission=permission,
+            created_at=datetime.now(timezone.utc),
+        ).model_dump()
+
+
+@app.get("/api/workspaces/{workspace_id}/shares")
+async def list_workspace_shares(request: Request, workspace_id: str):
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        ws = await db.get(Workspace, workspace_id)
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if not (_check_admin(request) or ws.user_id == user_id):
+            return JSONResponse(status_code=403, content=Error(error="Workspace owner only").model_dump())
+
+        result = await db.execute(
+            select(WorkspaceShare, Group.name)
+            .join(Group, Group.group_id == WorkspaceShare.group_id)
+            .where(WorkspaceShare.workspace_id == workspace_id)
+        )
+        return [
+            ShareOut(
+                workspace_id=workspace_id,
+                group_id=s.group_id,
+                group_name=group_name,
+                permission=s.permission,
+                created_at=s.created_at,
+            ).model_dump()
+            for s, group_name in result.all()
+        ]
+
+
+@app.delete("/api/workspaces/{workspace_id}/shares/{group_id}")
+async def unshare_workspace(request: Request, workspace_id: str, group_id: str):
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        ws = await db.get(Workspace, workspace_id)
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if not (_check_admin(request) or ws.user_id == user_id):
+            return JSONResponse(status_code=403, content=Error(error="Workspace owner only").model_dump())
+
+        share = await db.get(WorkspaceShare, {"workspace_id": workspace_id, "group_id": group_id})
+        if share is None:
+            return JSONResponse(status_code=404, content=Error(error="Not shared").model_dump())
+        await db.delete(share)
+        await record_audit_event(
+            db, "workspace.unshared",
+            actor_user_id=user_id,
+            workspace_id=workspace_id,
+            request_id=_get_request_id(request),
+            correlation_id=_get_correlation_id(request),
+            source_ip=_get_source_ip(request),
+            metadata={"group_id": group_id},
+        )
+        await db.commit()
+        return Ok().model_dump()
 
 
 # ─── Audit ingestion (internal) ──────────────────────────────────────

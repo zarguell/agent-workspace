@@ -156,3 +156,41 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     service: str = "control-plane"
     timestamp: datetime
+
+
+# ─── Groups & workspace sharing ─────────────────────────────────────
+
+class GroupOut(BaseModel):
+    group_id: str
+    name: str
+    created_at: datetime
+    role: Optional[str] = None  # caller's role in the group, when listed for a user
+
+
+class GroupDetail(BaseModel):
+    group_id: str
+    name: str
+    created_at: datetime
+    members: list[dict]  # [{user_id, username, display_name, role, joined_at}]
+
+
+class CreateGroupRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+
+
+class AddMemberRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=255)
+    role: str = "member"  # admin | member
+
+
+class ShareRequest(BaseModel):
+    group_id: str = Field(min_length=1, max_length=255)
+    permission: str = "view"  # view | operate
+
+
+class ShareOut(BaseModel):
+    workspace_id: str
+    group_id: str
+    group_name: str
+    permission: str
+    created_at: datetime

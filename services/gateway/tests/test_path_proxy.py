@@ -64,3 +64,29 @@ async def test_code_proxy_passthrough(client, valid_cookie, requests_log):
     assert resp.status_code == 200
     upstream = [r for r in requests_log if r.url.host == CLUSTER_IP]
     assert str(upstream[0].url) == f"http://{CLUSTER_IP}:8080/"
+
+
+async def test_shared_workspace_via_header(client, requests_log):
+    """Bob (member of a group with operate on ws-alice) routes to it via X-Workspace-Id."""
+    client.cookies.set("session", "bob-cookie")
+    resp = await client.get("/canvas/", headers={"X-Workspace-Id": "ws-alice"})
+    assert resp.status_code == 200
+    upstream = [r for r in requests_log if r.url.host == CLUSTER_IP]
+    assert str(upstream[0].url) == f"http://{CLUSTER_IP}:8000/"
+
+
+async def test_shared_workspace_defaults_to_own(client, requests_log):
+    """Without X-Workspace-Id, bob routes to his own workspace."""
+    client.cookies.set("session", "bob-cookie")
+    resp = await client.get("/canvas/")
+    assert resp.status_code == 503  # ws-bob is not routable in the mock ACL
+    assert not [r for r in requests_log if r.url.host == CLUSTER_IP]
+
+
+async def test_stranger_blocked_from_shared_workspace(client, requests_log):
+    """Eve has no access to ws-alice; the control plane 404s routing."""
+    client.cookies.set("session", "eve-cookie")
+    resp = await client.get("/canvas/", headers={"X-Workspace-Id": "ws-alice"})
+    assert resp.status_code == 503
+    assert "Could not resolve workspace routing information." in resp.text
+    assert not [r for r in requests_log if r.url.host == CLUSTER_IP]

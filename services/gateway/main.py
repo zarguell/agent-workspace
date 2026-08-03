@@ -58,12 +58,19 @@ async def validate_session(cookie_value: str | None) -> dict | None:
     return None
 
 
-async def get_routing_status(workspace_id: str) -> dict | None:
-    """Fetch internal routing status from the control plane."""
+async def get_routing_status(workspace_id: str, username: str | None = None) -> dict | None:
+    """Fetch internal routing status from the control plane.
+
+    *username* (the session user) is forwarded as X-Service-User so the
+    control plane can authorize the routing request.
+    """
+    headers = {"X-Service-Auth": SERVICE_AUTH_TOKEN}
+    if username:
+        headers["X-Service-User"] = username
     try:
         resp = await get_client().get(
             f"{CONTROL_PLANE_URL}/api/internal/workspaces/{workspace_id}/routing",
-            headers={"X-Service-Auth": SERVICE_AUTH_TOKEN},
+            headers=headers,
         )
         if resp.status_code == 200:
             return resp.json()
@@ -292,6 +299,7 @@ async def _relay_ws(client_ws: WebSocket, upstream_uri: str, auth_token: str | N
 async def resolve_workspace(
     username: str,
     session_cookie: str | None = None,
+    workspace_id: str | None = None,
 ) -> tuple[dict | None, Response | None]:
     """Resolve workspace routing info for the given user.
 
@@ -300,10 +308,15 @@ async def resolve_workspace(
     * If *routing* is not *None* the workspace is ready to proxy.
     * If *immediate_response* is set, return it to the caller directly
       (either a starting page, an error page, or a redirect).
-    """
-    workspace_id = workspace_id_for(username)
 
-    routing = await get_routing_status(workspace_id)
+    *workspace_id* defaults to the user's own workspace; pass it to route
+    to a workspace shared with one of the user's groups.
+    """
+    if not workspace_id:
+        workspace_id = workspace_id_for(username)
+
+    routing = await get_routing_status(workspace_id, username)
+
     if routing is None:
         return None, HTMLResponse(
             content=render_template("error.html", message="Could not resolve workspace routing information."),
@@ -391,7 +404,12 @@ async def path_proxy(request: Request, call_next):
         session = await validate_session(get_session_cookie(request))
         if not session:
             return RedirectResponse(url="/ui/login")
-        routing, ws_resp = await resolve_workspace(session["username"], get_session_cookie(request))
+        ws_override = request.headers.get("X-Workspace-Id") or None
+        routing, ws_resp = await resolve_workspace(
+            session["username"],
+            get_session_cookie(request),
+            workspace_id=ws_override,
+        )
         if ws_resp:
             return ws_resp
         cluster_ip = routing.get("cluster_ip")
