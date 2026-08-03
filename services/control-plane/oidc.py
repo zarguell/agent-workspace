@@ -15,6 +15,7 @@ import logging
 import os
 import secrets
 import time
+from urllib.parse import urlparse
 
 from authlib.integrations.httpx_client import AsyncOAuth2Client
 from fastapi import APIRouter, Request
@@ -44,8 +45,51 @@ OIDC_DISCOVERY_URL = (
     or f"{OIDC_ISSUER}/.well-known/openid-configuration"
 )
 
+# HTTPS enforcement: an active network MITM on a plain-HTTP OIDC endpoint
+# could substitute the discovery document/JWKS and mint id_tokens for any
+# subject, so every endpoint MUST be https:// unless the explicit dev/test
+# escape hatch below is set (the compose mock IdP runs over plain HTTP).
+def _insecure_flag_enabled(value: str | None) -> bool:
+    """Whether OIDC_ALLOW_INSECURE opts out of HTTPS enforcement."""
+    return (value or "").strip().lower() in ("1", "true", "yes")
+
+
+OIDC_ALLOW_INSECURE = _insecure_flag_enabled(os.environ.get("OIDC_ALLOW_INSECURE"))
+
 ENABLED = bool(OIDC_ISSUER and OIDC_CLIENT_ID and OIDC_CLIENT_SECRET and OIDC_REDIRECT_URI)
 ALLOWED_ALGS = ["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"]
+
+
+def _require_secure_url(url: str, what: str) -> str:
+    """Return `url` after enforcing https:// (unless OIDC_ALLOW_INSECURE).
+
+    Raising here — rather than silently fetching over plaintext — stops an
+    active network MITM from substituting the discovery document or JWKS.
+    """
+    if not OIDC_ALLOW_INSECURE and urlparse(url).scheme.lower() != "https":
+        raise ValueError(
+            f"OIDC {what} must be https:// (got '{url}'); refusing insecure "
+            "transport. Set OIDC_ALLOW_INSECURE=1 to allow it for local "
+            "development/testing only."
+        )
+    return url
+
+
+def _check_oidc_config() -> None:
+    """Validate OIDC endpoint schemes at startup; fail fast on insecure config."""
+    if not ENABLED:
+        return
+    _require_secure_url(OIDC_ISSUER, "issuer")
+    _require_secure_url(OIDC_DISCOVERY_URL, "discovery URL")
+    if OIDC_ALLOW_INSECURE:
+        logger.warning(
+            "OIDC_ALLOW_INSECURE is set: OIDC issuer/discovery/token/JWKS "
+            "traffic may run over plain HTTP. This is for local development/"
+            "testing only and MUST NOT be used in production."
+        )
+
+
+_check_oidc_config()
 
 router = APIRouter(prefix="/api/oidc", tags=["oidc"])
 
@@ -75,10 +119,11 @@ async def _discovery() -> dict:
     """Fetch (and cache) the provider's OIDC discovery document."""
     global _discovery_cache
     if _discovery_cache is None:
+        url = _require_secure_url(OIDC_DISCOVERY_URL, "discovery URL")
         async with _make_client() as client:
             resp = await client.request(
                 "GET",
-                OIDC_DISCOVERY_URL,
+                url,
                 withhold_token=True,
             )
             resp.raise_for_status()
@@ -86,8 +131,9 @@ async def _discovery() -> dict:
     return _discovery_cache
 
 async def _fetch_jwks(meta: dict) -> dict:
+    jwks_url = _require_secure_url(meta["jwks_uri"], "JWKS URL")
     async with _make_client() as client:
-        resp = await client.request("GET", meta["jwks_uri"], withhold_token=True)
+        resp = await client.request("GET", jwks_url, withhold_token=True)
         resp.raise_for_status()
         return resp.json()
 
@@ -202,7 +248,7 @@ async def oidc_callback(request: Request):
         client = _make_client()
         async with client:
             token = await client.fetch_token(
-                meta["token_endpoint"],
+                _require_secure_url(meta["token_endpoint"], "token endpoint"),
                 code=code,
                 code_verifier=pending["code_verifier"],
             )
@@ -245,6 +291,20 @@ async def _provision_session(claims: dict):
             db.add(user)
             await db.flush()
             logger.info("Provisioned SSO user %s (sub=%s)", user.username, sub)
+        else:
+            # Re-derive admin status on every successful login so OIDC admin
+            # membership changes propagate instead of drifting from the
+            # provisioning-time value. Only OIDC-linked users reach this
+            # branch (lookup is by oidc_sub), so password-created users'
+            # is_admin is never touched.
+            synced_admin = bool(email and email in OIDC_ADMIN_EMAILS)
+            if user.is_admin != synced_admin:
+                logger.info(
+                    "Synced SSO user %s admin status to %s",
+                    user.username,
+                    synced_admin,
+                )
+                user.is_admin = synced_admin
 
         # Auto-create the workspace, matching the local-login behavior.
         ws = await db.get(Workspace, f"ws-{user.username}")

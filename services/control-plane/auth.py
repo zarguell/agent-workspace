@@ -16,6 +16,16 @@ SESSION_TTL_HOURS = 24
 COOKIE_DOMAIN = os.environ.get("COOKIE_DOMAIN", "")
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
 
+# Loud startup warning: Secure off means session cookies traverse the
+# network in cleartext. Dev stacks (plain HTTP on localhost/agents.local.test)
+# need it off; production behind TLS MUST enable it.
+if not COOKIE_SECURE:
+    import logging
+    logging.getLogger(__name__).warning(
+        "COOKIE_SECURE is disabled: session cookies will be sent without the "
+        "Secure flag. Enable COOKIE_SECURE=true when serving over TLS."
+    )
+
 
 def hash_password(password: str) -> str:
     """Return bcrypt hash of password."""
@@ -27,15 +37,28 @@ def verify_password(password: str, password_hash: str) -> bool:
     return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
 
 
+# A valid bcrypt hash (cost 12, matching hash_password) of a throwaway
+# password. Used as a timing sink: when the username does not exist we still
+# run a full bcrypt check so the response time does not reveal existence.
+_DUMMY_PASSWORD_HASH = "$2b$12$FJU37WIw3OHp9vhbfj8Xoe/1Jh.h1owjsKnwc/0sT3pdhyrKXuOOW"
+
 async def authenticate_user(db: AsyncSession, username: str, password: str) -> User | None:
     """Validate username/password. Returns User or None."""
     result = await db.execute(select(User).where(User.username == username))
     user = result.scalar_one_or_none()
     if user is None:
+        # Equalize response time with the wrong-password path.
+        verify_password(password, _DUMMY_PASSWORD_HASH)
         return None
     if user.disabled_at is not None:
         return None
-    if not verify_password(password, user.password_hash):
+    try:
+        ok = verify_password(password, user.password_hash)
+    except ValueError:
+        # Unparseable hash: SSO accounts store password_hash="!" so a password
+        # attempt against them must be a uniform 401, never a 500.
+        ok = False
+    if not ok:
         return None
     return user
 

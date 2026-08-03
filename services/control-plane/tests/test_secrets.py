@@ -1,5 +1,8 @@
 """Workspace secrets: CRUD, permissions, encryption at rest."""
 
+
+import pytest
+
 from conftest import seed_user
 
 
@@ -108,3 +111,70 @@ async def test_invalid_key_rejected(client):
     await _login(client, "sk-owner")
     resp = await _set_secret(client, "ws-sk-owner", "bad key!", "v")
     assert resp.status_code == 400
+
+
+async def test_decrypt_value_raises_on_invalid_token(monkeypatch):
+    """A secret encrypted under a previous SECRETS_MASTER_KEY must raise a
+    clear error, never silently return ''."""
+    import secrets_store
+    from cryptography.fernet import Fernet
+
+    old_key = Fernet.generate_key().decode()
+    new_key = Fernet.generate_key().decode()
+
+    monkeypatch.setenv("SECRETS_MASTER_KEY", old_key)
+    secrets_store._fernet = None
+    blob = secrets_store.encrypt_value("hunter2")
+
+    monkeypatch.setenv("SECRETS_MASTER_KEY", new_key)  # simulated key rotation
+    secrets_store._fernet = None
+    try:
+        with pytest.raises(secrets_store.SecretDecryptionError):
+            secrets_store.decrypt_value(blob)
+    finally:
+        # Re-init lazily from the (restored) conftest key for later tests.
+        secrets_store._fernet = None
+
+
+async def test_get_secret_returns_500_on_decrypt_failure(app, db, monkeypatch):
+    """A lost/rotated SECRETS_MASTER_KEY must surface as a loud 500 instead
+    of a silently-empty secret value."""
+    import httpx
+    import secrets_store
+    from cryptography.fernet import Fernet
+    from models import WorkspaceSecret
+
+    # Starlette 1.x re-raises exceptions after sending its 500 response (so
+    # servers can log them), which test clients see as a raised error unless
+    # they opt out of re-raising.
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        owner = await seed_user("rot-owner")
+        await client.post("/api/login", json={"username": "rot-owner", "password": "pw"})
+
+        key1 = Fernet.generate_key().decode()
+        key2 = Fernet.generate_key().decode()
+        monkeypatch.setenv("SECRETS_MASTER_KEY", key1)
+        secrets_store._fernet = None
+        from secrets_store import encrypt_value
+        encrypted = encrypt_value("top-secret")
+
+        # The test DB persists across runs; drop any row from a prior run.
+        existing = await db.get(WorkspaceSecret, {"workspace_id": "ws-rot-owner", "key": "API_KEY"})
+        if existing is not None:
+            await db.delete(existing)
+        db.add(WorkspaceSecret(
+            workspace_id="ws-rot-owner",
+            key="API_KEY",
+            value_encrypted=encrypted,
+            created_by=owner.user_id,
+        ))
+        await db.commit()
+
+        monkeypatch.setenv("SECRETS_MASTER_KEY", key2)
+        secrets_store._fernet = None
+        try:
+            resp = await client.get("/api/workspaces/ws-rot-owner/secrets/API_KEY")
+            assert resp.status_code == 500
+        finally:
+            secrets_store._fernet = None
