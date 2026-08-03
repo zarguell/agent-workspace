@@ -243,3 +243,32 @@ class UsagePage(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+# ─── MCP servers ─────────────────────────────────────────────────────
+
+class McpServerOut(BaseModel):
+    server_id: str
+    workspace_id: str
+    name: str
+    port: int = Field(ge=1, le=65535)
+    enabled: bool = True
+    created_at: datetime
+
+
+class McpServerCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    port: int = Field(ge=1, le=65535)
+    enabled: bool = True
+
+
+class McpServerUpdate(BaseModel):
+    enabled: Optional[bool] = None
+
+
+class McpTargetOut(BaseModel):
+    workspace_id: str
+    server_id: str
+    name: str
+    port: int
+    enabled: bool

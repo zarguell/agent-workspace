@@ -212,3 +212,31 @@ class UsageEvent(Base):
     # First day of the UTC month the usage belongs to (billing period).
     period_start = Column(DateTime(timezone=True), nullable=False, index=True)
     recorded_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+class McpServer(Base):
+    """A registered MCP (Model Context Protocol) server for a workspace.
+
+    MCP servers run in (or alongside) the workspace pod; the gateway proxies
+    /mcp/{server_id} to http://{workspace-cluster-ip}:{port} after
+    authenticating the session and authorizing the workspace access.
+    """
+
+    __tablename__ = "mcp_servers"
+
+    server_id = Column(String(255), primary_key=True)  # mcp-<uuid>
+    workspace_id = Column(
+        String(255),
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name = Column(String(255), nullable=False)
+    port = Column(Integer, nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+    created_by = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)

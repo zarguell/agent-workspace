@@ -85,7 +85,7 @@
   <div class="nav">
     <a href="/ui/groups">Groups</a>
     <button class="logout-btn" id="logout-btn">Sign Out</button>
-  </div>
+</div>
 </div>
 <div class="container" id="workspace-list">
   <div class="loading">Loading workspaces…</div>
@@ -171,8 +171,16 @@ function workspaceCard(ws) {
       ${state === "running" ? `<button class="btn btn-primary" onclick="openWorkspace('${ws.workspace_id}', '/canvas/')">Open Canvas</button><button class="btn btn-secondary" onclick="openWorkspace('${ws.workspace_id}', '/code/')">Open Code</button>` : ""}
       ${state === "starting" ? `<span class="btn btn-secondary" disabled>Starting…</span>` : ""}
       ${state === "running" ? `<button class="btn btn-warning" onclick="hibernateWorkspace('${ws.workspace_id}')">Hibernate</button>` : ""}
-      ${isOwn ? `<button class="btn btn-secondary" id="share-toggle-${ws.workspace_id}">Sharing</button>` : ""}
+      ${isOwn ? `<button class="btn btn-secondary" id="share-toggle-${ws.workspace_id}">Sharing</button><button class="btn btn-secondary" id="mcp-toggle-${ws.workspace_id}">MCP Servers</button>` : ""}
     </div>
+    ${isOwn ? `<div class="share-panel" id="mcp-panel-${ws.workspace_id}" hidden>
+      <div id="mcp-rows-${ws.workspace_id}"></div>
+      <div class="add-share">
+        <input type="text" id="mcp-name-${ws.workspace_id}" placeholder="name" style="padding:0.375rem 0.5rem;border:1px solid #334155;border-radius:6px;background:#0f172a;color:#e2e8f0;font-size:0.8125rem">
+        <input type="number" id="mcp-port-${ws.workspace_id}" placeholder="port" min="1" max="65535" value="3001" style="width:5rem;padding:0.375rem 0.5rem;border:1px solid #334155;border-radius:6px;background:#0f172a;color:#e2e8f0;font-size:0.8125rem">
+        <button class="btn btn-secondary btn-sm" id="mcp-add-${ws.workspace_id}">Register</button>
+      </div>
+    </div>` : ""}
     ${isOwn ? `<div class="share-panel" id="share-panel-${ws.workspace_id}" hidden>
       <div id="share-rows-${ws.workspace_id}"></div>
       <div class="add-share">
@@ -196,8 +204,76 @@ function workspaceCard(ws) {
       }
     });
     card.querySelector(`#share-add-${ws.workspace_id}`).addEventListener("click", () => addShare(ws.workspace_id, card));
+
+    const mcpToggle = card.querySelector(`#mcp-toggle-${ws.workspace_id}`);
+    const mcpPanel = card.querySelector(`#mcp-panel-${ws.workspace_id}`);
+    mcpToggle.addEventListener("click", async () => {
+      mcpPanel.hidden = !mcpPanel.hidden;
+      if (!mcpPanel.hidden) {
+        await loadMcpServers(ws.workspace_id, card);
+      }
+    });
+    card.querySelector(`#mcp-add-${ws.workspace_id}`).addEventListener("click", () => addMcpServer(ws.workspace_id, card));
   }
   return card;
+}
+
+async function loadMcpServers(id, card) {
+  const rows = card.querySelector(`#mcp-rows-${id}`);
+  try {
+    const resp = await api(`/api/workspaces/${id}/mcp-servers`);
+    const servers = await resp.json();
+    rows.innerHTML = "";
+    if (servers.length === 0) {
+      rows.innerHTML = '<span style="color:#64748b">No MCP servers registered.</span>';
+      return;
+    }
+    for (const s of servers) {
+      const row = document.createElement("div");
+      row.className = "share-row";
+      row.innerHTML = `
+        <span>${escapeHtml(s.name)} <span class="perm">:${s.port} ${s.enabled ? "" : "(disabled)"}</span></span>
+        <span>
+          <button class="btn btn-secondary btn-sm" data-mcp-toggle="${s.server_id}">${s.enabled ? "Disable" : "Enable"}</button>
+          <button class="btn btn-danger btn-sm" data-mcp-remove="${s.server_id}">Remove</button>
+        </span>`;
+      row.querySelector(`[data-mcp-toggle="${s.server_id}"]`).addEventListener("click", async () => {
+        await api(`/api/workspaces/${id}/mcp-servers/${s.server_id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: !s.enabled }),
+        });
+        loadMcpServers(id, card);
+      });
+      row.querySelector(`[data-mcp-remove="${s.server_id}"]`).addEventListener("click", async () => {
+        await api(`/api/workspaces/${id}/mcp-servers/${s.server_id}`, { method: "DELETE" });
+        toast("MCP server removed");
+        loadMcpServers(id, card);
+      });
+      rows.appendChild(row);
+    }
+  } catch (err) {
+    rows.innerHTML = '<span class="perm">Could not load MCP servers</span>';
+  }
+}
+
+async function addMcpServer(id, card) {
+  const name = card.querySelector(`#mcp-name-${id}`).value.trim();
+  const port = parseInt(card.querySelector(`#mcp-port-${id}`).value, 10);
+  if (!name || !port) { toast("Name and port required"); return; }
+  const resp = await api(`/api/workspaces/${id}/mcp-servers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, port }),
+  });
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    toast(data.error || "Could not register MCP server");
+    return;
+  }
+  card.querySelector(`#mcp-name-${id}`).value = "";
+  toast("MCP server registered");
+  loadMcpServers(id, card);
 }
 
 async function loadUsageSummary() {

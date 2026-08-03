@@ -29,7 +29,7 @@ from auth import (
 )
 from database import async_session_factory, get_session, init_db
 from idempotency import idempotency_store
-from models import AuditEvent, Group, GroupMember, Quota, Session, UsageEvent, User, Workspace, WorkspaceShare
+from models import AuditEvent, Group, GroupMember, McpServer, Quota, Session, UsageEvent, User, Workspace, WorkspaceShare
 from reconciler import reconciler
 from schemas import (
     AddMemberRequest,
@@ -42,6 +42,10 @@ from schemas import (
     HealthResponse,
     LoginRequest,
     LoginResponse,
+    McpServerCreate,
+    McpServerOut,
+    McpServerUpdate,
+    McpTargetOut,
     Ok,
     Operation,
     QuotaOut,
@@ -679,6 +683,50 @@ async def get_workspace_routing(request: Request, workspace_id: str):
         ).model_dump()
 
 
+@app.get("/api/internal/workspaces/{workspace_id}/mcp/{server_id}")
+async def get_mcp_target(request: Request, workspace_id: str, server_id: str):
+    """Resolve an MCP server's port for the gateway.
+
+    Same authorization as routing (owner / admin / operate share); a
+    disabled or foreign server is a 404 (no existence leak). The gateway
+    combines the returned port with the workspace's cluster IP.
+    """
+    service_user = request.headers.get("X-Service-User", "")
+    if not service_user:
+        return JSONResponse(status_code=401, content=Error(error="Missing X-Service-User").model_dump())
+
+    async with async_session_factory() as db:
+        result = await db.execute(select(Workspace).where(Workspace.workspace_id == workspace_id))
+        ws = result.scalar_one_or_none()
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+
+        user_result = await db.execute(select(User).where(User.username == service_user))
+        user = user_result.scalar_one_or_none()
+        if user is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+
+        allowed = (
+            user.is_admin
+            or ws.user_id == user.user_id
+            or await _user_has_share(db, user.user_id, workspace_id, "operate")
+        )
+        if not allowed:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+
+        server = await db.get(McpServer, server_id)
+        if server is None or server.workspace_id != workspace_id or not server.enabled:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+
+        return McpTargetOut(
+            workspace_id=workspace_id,
+            server_id=server_id,
+            name=server.name,
+            port=server.port,
+            enabled=server.enabled,
+        ).model_dump()
+
+
 
 # ─── Admin endpoints ──────────────────────────────────────────────────
 
@@ -1061,6 +1109,127 @@ async def unshare_workspace(request: Request, workspace_id: str, group_id: str):
             correlation_id=_get_correlation_id(request),
             source_ip=_get_source_ip(request),
             metadata={"group_id": group_id},
+        )
+        await db.commit()
+        return Ok().model_dump()
+
+
+# ─── MCP servers ─────────────────────────────────────────────────────
+
+@app.get("/api/workspaces/{workspace_id}/mcp-servers")
+async def list_mcp_servers(request: Request, workspace_id: str):
+    async with async_session_factory() as db:
+        ws = await _get_workspace_for_user(request, workspace_id, db)
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        result = await db.execute(
+            select(McpServer)
+            .where(McpServer.workspace_id == workspace_id)
+            .order_by(McpServer.created_at)
+        )
+        return [
+            McpServerOut(
+                server_id=s.server_id,
+                workspace_id=s.workspace_id,
+                name=s.name,
+                port=s.port,
+                enabled=s.enabled,
+                created_at=s.created_at,
+            ).model_dump()
+            for s in result.scalars().all()
+        ]
+
+
+@app.post("/api/workspaces/{workspace_id}/mcp-servers", status_code=201)
+async def register_mcp_server(request: Request, workspace_id: str):
+    body = await request.json()
+    data = McpServerCreate(**body)
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        ws = await _get_workspace_for_user(request, workspace_id, db)
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if not await _can_operate_workspace(request, ws, db):
+            return JSONResponse(status_code=403, content=Error(error="Insufficient permission").model_dump())
+
+        server_id = f"mcp-{uuid.uuid4()}"
+        server = McpServer(
+            server_id=server_id,
+            workspace_id=workspace_id,
+            name=data.name,
+            port=data.port,
+            enabled=data.enabled,
+            created_by=user_id,
+        )
+        db.add(server)
+        await record_audit_event(
+            db, "mcp.server_registered",
+            actor_user_id=user_id,
+            workspace_id=workspace_id,
+            request_id=_get_request_id(request),
+            correlation_id=_get_correlation_id(request),
+            source_ip=_get_source_ip(request),
+            metadata={"server_id": server_id, "name": data.name, "port": data.port},
+        )
+        await db.commit()
+        return McpServerOut(
+            server_id=server_id,
+            workspace_id=workspace_id,
+            name=server.name,
+            port=server.port,
+            enabled=server.enabled,
+            created_at=server.created_at,
+        ).model_dump()
+
+
+@app.patch("/api/workspaces/{workspace_id}/mcp-servers/{server_id}")
+async def update_mcp_server(request: Request, workspace_id: str, server_id: str):
+    body = await request.json()
+    data = McpServerUpdate(**body)
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        ws = await _get_workspace_for_user(request, workspace_id, db)
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if not await _can_operate_workspace(request, ws, db):
+            return JSONResponse(status_code=403, content=Error(error="Insufficient permission").model_dump())
+        server = await db.get(McpServer, server_id)
+        if server is None or server.workspace_id != workspace_id:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if data.enabled is not None:
+            server.enabled = data.enabled
+        await db.commit()
+        return McpServerOut(
+            server_id=server.server_id,
+            workspace_id=server.workspace_id,
+            name=server.name,
+            port=server.port,
+            enabled=server.enabled,
+            created_at=server.created_at,
+        ).model_dump()
+
+
+@app.delete("/api/workspaces/{workspace_id}/mcp-servers/{server_id}")
+async def delete_mcp_server(request: Request, workspace_id: str, server_id: str):
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        ws = await _get_workspace_for_user(request, workspace_id, db)
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if not await _can_operate_workspace(request, ws, db):
+            return JSONResponse(status_code=403, content=Error(error="Insufficient permission").model_dump())
+        server = await db.get(McpServer, server_id)
+        if server is None or server.workspace_id != workspace_id:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        await db.delete(server)
+        await record_audit_event(
+            db, "mcp.server_unregistered",
+            actor_user_id=user_id,
+            workspace_id=workspace_id,
+            request_id=_get_request_id(request),
+            correlation_id=_get_correlation_id(request),
+            source_ip=_get_source_ip(request),
+            metadata={"server_id": server_id},
         )
         await db.commit()
         return Ok().model_dump()

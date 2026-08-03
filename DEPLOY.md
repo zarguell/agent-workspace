@@ -101,13 +101,39 @@ ports `6767` (Paseo), `8080` (code-server), `8000` (Canvas), `9000` (agent),
 then set `WORKSPACE_DEV_HOST` to its address (a compose service name or
 `host.docker.internal`) and restart:
 
-```bash
-WORKSPACE_DEV_HOST=workspace-dev docker compose up -d
-```
-
 The control plane then reports that host as the workspace ClusterIP and
 probes its `:9000/ready` endpoint for readiness, so the gateway proxies to
 it exactly as it would to a pod.
+
+### MCP servers
+
+Workspace MCP (Model Context Protocol) servers are registered per workspace
+(control-plane API or the "MCP Servers" panel on the workspaces page) and
+served by the gateway at `/mcp/{server_id}` — authenticated with the session
+cookie and authorized like any workspace route (owner, admin, or a group
+share with operate permission). MCP JSON-RPC requests are proxied verbatim
+to `http://{workspace-cluster-ip}:{port}`:
+
+```bash
+curl -X POST https://example.com/mcp/<server_id> \
+  -H "Content-Type: application/json" \
+  -b "session=<cookie>" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+Register a server:
+
+```bash
+curl -X POST /api/workspaces/<workspace_id>/mcp-servers \
+  -H "Content-Type: application/json" \
+  -d '{"name":"my-tools","port":3001}'
+```
+
+The gateway strips the `/mcp/{server_id}` prefix before forwarding, so
+sub-paths like `/mcp/{server_id}/messages` reach the server as `/messages`.
+Disable a server to take it offline without unregistering.
+
+
 
 
 ## Configuration

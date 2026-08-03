@@ -1,12 +1,13 @@
 """Test fixtures for the gateway suite — the control plane is fully mocked.
 
 Two things need the mock: the module-global ``main.http_client`` (used by
-validate_session / get_routing_status / trigger_start / record_audit) and
-every fresh ``httpx.AsyncClient()`` the gateway constructs inline
-(path_proxy, login_proxy, api_proxy, _proxy_paseo). The app fixture patches
-``main.httpx.AsyncClient`` with a factory that returns a MockTransport-backed
-client for no-arg construction and delegates to the real class when a
-transport is supplied (so the test client itself is unaffected).
+validate_session / get_routing_status / get_mcp_target / trigger_start /
+record_audit) and every fresh ``httpx.AsyncClient()`` the gateway constructs
+inline (path_proxy, login_proxy, api_proxy, _proxy_paseo). The app fixture
+patches ``main.httpx.AsyncClient`` with a factory that returns a
+MockTransport-backed client for no-arg construction and delegates to the
+real class when a transport is supplied (so the test client itself is
+unaffected).
 
 ``os.chdir`` to the service dir is required: main.py loads templates from
 the relative path "templates".
@@ -36,6 +37,12 @@ UPSTREAM_HTML = (
     '<body><script src="/assets/app.js"></script></body></html>'
 )
 
+MCP_RESPONSE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {"tools": [{"name": "demo", "description": "demo tool"}]},
+}
+
 # Mutable per-test state read by the mock handler.
 _requests_log: list = []
 _routing_config = {"state": "running", "agent_ready": True, "cluster_ip": CLUSTER_IP}
@@ -51,6 +58,9 @@ _SESSIONS = {
 # owner alice + bob who holds an operate share on ws-alice).
 _ROUTING_ACL = {"ws-alice": {"alice", "bob"}}
 
+# MCP servers available per workspace (only mcp-1 exists and is enabled).
+_MCP_SERVERS = {"ws-alice": {"mcp-1": 3001}}
+
 
 def _handler(request: httpx.Request) -> httpx.Response:
     _requests_log.append(request)
@@ -64,6 +74,7 @@ def _handler(request: httpx.Request) -> httpx.Response:
                 if marker in cookie:
                     return httpx.Response(200, json=session)
             return httpx.Response(401, json={"error": "No valid session"})
+
         if request.method == "GET" and path.startswith("/api/internal/workspaces/") and path.endswith("/routing"):
             ws_id = path.split("/")[4]
             service_user = request.headers.get("x-service-user", "")
@@ -76,6 +87,24 @@ def _handler(request: httpx.Request) -> httpx.Response:
                 "agent_ready": _routing_config["agent_ready"],
                 "exposures": [],
             })
+
+        if request.method == "GET" and path.startswith("/api/internal/workspaces/") and "/mcp/" in path:
+            # /api/internal/workspaces/{ws}/mcp/{server_id}
+            parts = path.split("/")
+            ws_id = parts[4]
+            server_id = parts[6]
+            service_user = request.headers.get("x-service-user", "")
+            port = _MCP_SERVERS.get(ws_id, {}).get(server_id)
+            if service_user in _ROUTING_ACL.get(ws_id, set()) and port is not None:
+                return httpx.Response(200, json={
+                    "workspace_id": ws_id,
+                    "server_id": server_id,
+                    "name": "tools",
+                    "port": port,
+                    "enabled": True,
+                })
+            return httpx.Response(404, json={"error": "Not found"})
+
         if request.method == "POST" and path.startswith("/api/workspaces/") and path.endswith("/start"):
             return httpx.Response(202, json={
                 "workspace_id": path.split("/")[3],
@@ -86,6 +115,8 @@ def _handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"error": "not found"})
 
     if url.host == CLUSTER_IP:
+        if url.port == 3001:
+            return httpx.Response(200, json=MCP_RESPONSE, headers={"content-type": "application/json"})
         return httpx.Response(200, text=UPSTREAM_HTML, headers={"content-type": "text/html"})
 
     return httpx.Response(404, json={"error": "not found"})

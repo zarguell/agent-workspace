@@ -79,6 +79,20 @@ async def get_routing_status(workspace_id: str, username: str | None = None) -> 
     return None
 
 
+async def get_mcp_target(workspace_id: str, server_id: str, username: str) -> dict | None:
+    """Resolve an MCP server's port from the control plane (authorized)."""
+    try:
+        resp = await get_client().get(
+            f"{CONTROL_PLANE_URL}/api/internal/workspaces/{workspace_id}/mcp/{server_id}",
+            headers={"X-Service-Auth": SERVICE_AUTH_TOKEN, "X-Service-User": username},
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except httpx.HTTPError:
+        pass
+    return None
+
+
 async def trigger_start(workspace_id: str, session_cookie: str | None = None) -> bool:
     """Idempotently start / resume a workspace.
 
@@ -395,6 +409,46 @@ async def path_proxy(request: Request, call_next):
     port_map = {"/canvas": 8000, "/code": 8080, "/chat": 6767}
     upstream_port = None
     prefix = None
+    if BASE == "/mcp" or BASE.startswith("/mcp/"):
+        session = await validate_session(get_session_cookie(request))
+        if not session:
+            return RedirectResponse(url="/ui/login")
+        ws_override = (
+            request.headers.get("X-Workspace-Id")
+            or request.cookies.get("workspace")
+            or None
+        )
+        routing, ws_resp = await resolve_workspace(
+            session["username"],
+            get_session_cookie(request),
+            workspace_id=ws_override,
+        )
+        if ws_resp:
+            return ws_resp
+        cluster_ip = routing.get("cluster_ip")
+        if not cluster_ip:
+            return HTMLResponse(
+                content=render_template("error.html", message="Workspace has no network endpoint."),
+                status_code=503,
+            )
+        parts = [p for p in BASE.split("/") if p]
+        if len(parts) < 2:
+            return HTMLResponse(
+                content=render_template("error.html", message="Missing MCP server id."),
+                status_code=404,
+            )
+        server_id = parts[1]
+        workspace_id = routing.get("workspace_id") or workspace_id_for(session["username"])
+        target = await get_mcp_target(workspace_id, server_id, session["username"])
+        if not target:
+            return HTMLResponse(
+                content=render_template("error.html", message="MCP server not found."),
+                status_code=404,
+            )
+        asyncio.ensure_future(record_audit("gateway.route_granted", {"route_class": "mcp", "server_id": server_id}))
+        return await proxy_http(request, f"http://{cluster_ip}:{target['port']}", strip_prefix=f"/mcp/{server_id}")
+
+
     for p, port in port_map.items():
         if BASE == p or BASE.startswith(p + "/"):
             upstream_port = port
