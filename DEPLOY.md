@@ -347,3 +347,45 @@ helm upgrade --install agent-platform charts/agent-platform \
   --namespace agent-platform \
   --set images.tag=v2
 ```
+
+## Backup & Restore
+
+The control plane's Postgres holds all platform state (users, workspaces,
+groups, shares, usage, encrypted secrets, MCP registrations, audit). The
+workspace *data* itself (agent state, files) lives on the workspace PVCs and
+is not covered here — back that up at the cluster/storage layer.
+
+### Compose deployments
+
+```bash
+scripts/backup.sh                 # dumps to backups/agentplatform-<stamp>.sql, keeps last 10
+BACKUP_DIR=/path/to/dir KEEP=30 scripts/backup.sh
+
+scripts/restore.sh                                # newest dump in backups/
+scripts/restore.sh backups/agentplatform-<stamp>.sql
+```
+
+`restore.sh` wipes the public schema and re-imports the dump, so the
+database ends up exactly as it was at backup time. Restart the control
+plane afterwards to re-run its idempotent migrations (they are no-ops on a
+restored schema). Sessions survive the restore — they are part of the dump.
+
+Disaster-recovery sequence:
+
+```bash
+scripts/backup.sh
+docker compose down -v          # destroys the postgres volume
+docker compose up -d
+scripts/restore.sh
+docker compose restart control-plane
+```
+
+### Kubernetes deployments
+
+```bash
+kubectl exec -i deploy/agent-platform-postgres -- pg_dump -U agent -d agentplatform > backup.sql
+kubectl exec -i deploy/agent-platform-postgres -- psql -U agent -d agentplatform < backup.sql
+```
+
+Encrypted secrets remain readable after restore only if `SECRETS_MASTER_KEY`
+is unchanged — the encrypted blobs are part of the dump.
