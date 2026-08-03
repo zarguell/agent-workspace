@@ -90,3 +90,22 @@ async def test_stranger_blocked_from_shared_workspace(client, requests_log):
     assert resp.status_code == 503
     assert "Could not resolve workspace routing information." in resp.text
     assert not [r for r in requests_log if r.url.host == CLUSTER_IP]
+
+
+async def test_shared_workspace_via_cookie(client, requests_log):
+    """Bob selects ws-alice via the workspace cookie (no header needed)."""
+    client.cookies.set("session", "bob-cookie")
+    client.cookies.set("workspace", "ws-alice")
+    resp = await client.get("/canvas/")
+    assert resp.status_code == 200
+    upstream = [r for r in requests_log if r.url.host == CLUSTER_IP]
+    assert str(upstream[0].url) == f"http://{CLUSTER_IP}:8000/"
+
+
+async def test_header_takes_precedence_over_cookie(client, valid_cookie, requests_log):
+    """X-Workspace-Id beats the workspace cookie (cookie says ws-bob)."""
+    client.cookies.set("workspace", "ws-bob")  # not routable for alice
+    resp = await client.get("/canvas/", headers={"X-Workspace-Id": "ws-alice"})
+    assert resp.status_code == 200
+    upstream = [r for r in requests_log if r.url.host == CLUSTER_IP]
+    assert str(upstream[0].url) == f"http://{CLUSTER_IP}:8000/"

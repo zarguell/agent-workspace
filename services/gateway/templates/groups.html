@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Groups — Agent Workspace</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #0f172a; color: #e2e8f0;
+    min-height: 100vh;
+  }
+  .header {
+    background: #1e293b; border-bottom: 1px solid #334155; padding: 1rem 2rem;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .header h1 { font-size: 1.25rem; color: #f1f5f9; }
+  .header .nav { display: flex; gap: 1rem; align-items: center; }
+  .nav a, .logout-btn {
+    background: none; border: 1px solid #475569; color: #94a3b8;
+    padding: 0.375rem 0.75rem; border-radius: 6px; cursor: pointer;
+    font-size: 0.8125rem; text-decoration: none; display: inline-block;
+  }
+  .nav a:hover, .logout-btn:hover { border-color: #64748b; color: #e2e8f0; }
+  .container { max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+  .create-bar { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }
+  .create-bar input {
+    flex: 1; padding: 0.625rem 0.75rem; border: 1px solid #334155;
+    border-radius: 6px; background: #0f172a; color: #e2e8f0; font-size: 0.9375rem;
+    outline: none;
+  }
+  .create-bar input:focus { border-color: #6366f1; }
+  .card {
+    background: #1e293b; border-radius: 10px; padding: 1.25rem 1.5rem;
+    margin-bottom: 1rem;
+  }
+  .card .head { display: flex; align-items: center; justify-content: space-between; }
+  .card h2 { font-size: 1.125rem; }
+  .badge {
+    display: inline-block; padding: 0.25rem 0.5rem; border-radius: 4px;
+    font-size: 0.75rem; font-weight: 600;
+  }
+  .badge.admin { background: #1e3a5f; color: #93c5fd; }
+  .badge.member { background: #334155; color: #cbd5e1; }
+  .btn {
+    padding: 0.375rem 0.75rem; border: none; border-radius: 6px;
+    font-size: 0.8125rem; font-weight: 500; cursor: pointer;
+    text-decoration: none; display: inline-block;
+  }
+  .btn-primary { background: #6366f1; color: #fff; }
+  .btn-primary:hover { background: #4f46e5; }
+  .btn-danger { background: #7f1d1d; color: #fecaca; }
+  .btn-danger:hover { background: #991b1b; }
+  .btn-secondary { background: #334155; color: #e2e8f0; }
+  .btn-secondary:hover { background: #475569; }
+  .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+  .members { margin-top: 1rem; border-top: 1px solid #334155; padding-top: 0.75rem; }
+  .member-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.375rem 0; font-size: 0.875rem;
+  }
+  .member-row .name { color: #cbd5e1; }
+  .member-row .role { color: #64748b; font-size: 0.75rem; }
+  .add-member { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
+  .add-member input, .add-member select {
+    padding: 0.375rem 0.5rem; border: 1px solid #334155; border-radius: 6px;
+    background: #0f172a; color: #e2e8f0; font-size: 0.8125rem; outline: none;
+  }
+  .loading { text-align: center; padding: 3rem; color: #64748b; }
+  .error-card { background: #7f1d1d; border-radius: 10px; padding: 1.5rem; text-align: center; }
+  .toast {
+    position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
+    background: #065f46; color: #d1fae5; padding: 0.625rem 1.25rem;
+    border-radius: 8px; font-size: 0.875rem; display: none; z-index: 10;
+  }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Groups</h1>
+  <div class="nav">
+    <a href="/ui/workspaces">Workspaces</a>
+    <button class="logout-btn" id="logout-btn">Sign Out</button>
+  </div>
+</div>
+<div class="container">
+  <div class="create-bar">
+    <input type="text" id="group-name" placeholder="New group name" maxlength="255">
+    <button class="btn btn-primary" id="create-btn">Create Group</button>
+  </div>
+  <div id="group-list">
+    <div class="loading">Loading groups…</div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+async function logout() {
+  await fetch("/api/logout", { method: "POST" });
+  window.location.href = "/ui/login";
+}
+document.getElementById("logout-btn").addEventListener("click", logout);
+
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.style.display = "block";
+  setTimeout(() => { el.style.display = "none"; }, 2500);
+}
+
+async function api(path, opts) {
+  const resp = await fetch(path, opts);
+  if (resp.status === 401) { window.location.href = "/ui/login"; throw new Error("unauthorized"); }
+  return resp;
+}
+
+async function loadGroups() {
+  const el = document.getElementById("group-list");
+  try {
+    const resp = await api("/api/groups");
+    const groups = await resp.json();
+    if (groups.length === 0) {
+      el.innerHTML = '<p style="text-align:center;color:#64748b">No groups yet. Create one to share workspaces with a team.</p>';
+      return;
+    }
+    el.innerHTML = "";
+    for (const g of groups) {
+      el.appendChild(await groupCard(g));
+    }
+  } catch (err) {
+    el.innerHTML = `<div class="error-card">Failed to load groups: ${err.message}</div>`;
+  }
+}
+
+async function groupCard(g) {
+  const card = document.createElement("div");
+  card.className = "card";
+  const isAdmin = g.role === "admin";
+  card.innerHTML = `
+    <div class="head">
+      <div>
+        <h2>${escapeHtml(g.name)}</h2>
+        <span class="badge ${isAdmin ? "admin" : "member"}">${g.role}</span>
+      </div>
+      ${isAdmin ? `<button class="btn btn-danger btn-sm" id="delete-${g.group_id}">Delete</button>` : ""}
+    </div>
+    <div class="members" id="members-${g.group_id}"><span class="loading">Loading members…</span></div>`;
+  card.querySelector(`#delete-${g.group_id}`)?.addEventListener("click", async () => {
+    if (!confirm(`Delete group "${g.name}"? Memberships will be removed.`)) return;
+    await api(`/api/groups/${g.group_id}`, { method: "DELETE" });
+    toast("Group deleted");
+    loadGroups();
+  });
+  await loadMembers(g, card, isAdmin);
+  return card;
+}
+
+async function loadMembers(g, card, isAdmin) {
+  const box = card.querySelector(`#members-${g.group_id}`);
+  try {
+    const resp = await api(`/api/groups/${g.group_id}`);
+    const detail = await resp.json();
+    box.innerHTML = "";
+    for (const m of detail.members) {
+      const row = document.createElement("div");
+      row.className = "member-row";
+      row.innerHTML = `
+        <span><span class="name">${escapeHtml(m.username)}</span> <span class="role">(${m.role})</span></span>
+        ${isAdmin ? `<button class="btn btn-danger btn-sm" data-remove="${m.user_id}">Remove</button>` : ""}`;
+      const removeBtn = row.querySelector(`[data-remove="${m.user_id}"]`);
+      if (removeBtn) {
+        removeBtn.addEventListener("click", async () => {
+          await api(`/api/groups/${g.group_id}/members/${m.user_id}`, { method: "DELETE" });
+          toast(`Removed ${m.username}`);
+          loadMembers(g, card, isAdmin);
+        });
+      }
+      box.appendChild(row);
+    }
+    if (isAdmin) {
+      const add = document.createElement("div");
+      add.className = "add-member";
+      add.innerHTML = `
+        <input type="text" placeholder="username" id="add-user-${g.group_id}">
+        <select id="add-role-${g.group_id}">
+          <option value="member">member</option>
+          <option value="admin">admin</option>
+        </select>
+        <button class="btn btn-secondary btn-sm" id="add-btn-${g.group_id}">Add</button>`;
+      add.querySelector(`#add-btn-${g.group_id}`).addEventListener("click", async () => {
+        const name = add.querySelector(`#add-user-${g.group_id}`).value.trim();
+        if (!name) return;
+        const role = add.querySelector(`#add-role-${g.group_id}`).value;
+        const resp = await api(`/api/groups/${g.group_id}/members`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: name, role }),
+        });
+        if (!resp.ok) {
+          const data = await resp.json().catch(() => ({}));
+          toast(data.error || "Could not add member");
+          return;
+        }
+        toast(`Added ${name}`);
+        loadMembers(g, card, isAdmin);
+      });
+      box.appendChild(add);
+    }
+  } catch (err) {
+    box.innerHTML = `<span class="role">Could not load members</span>`;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+document.getElementById("create-btn").addEventListener("click", async () => {
+  const name = document.getElementById("group-name").value.trim();
+  if (!name) return;
+  const resp = await api("/api/groups", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    toast(data.error || "Could not create group");
+    return;
+  }
+  document.getElementById("group-name").value = "";
+  toast("Group created");
+  loadGroups();
+});
+
+loadGroups();
+</script>
+</body>
+</html>

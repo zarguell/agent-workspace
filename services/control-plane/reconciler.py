@@ -375,14 +375,19 @@ class Reconciler:
             return False
 
     async def _get_cluster_ip(self, user_id: str) -> Optional[str]:
-        """Get ClusterIP of the workspace service."""
+        """Get ClusterIP of the workspace service.
+
+        Any failure (no kubeconfig, cluster unreachable, service absent)
+        yields None — routing status must never 500 because K8s is not
+        reachable.
+        """
         ns = _ns_name(user_id)
-        self._init_k8s()
-        name = _svc_name(user_id)
         try:
+            self._init_k8s()
+            name = _svc_name(user_id)
             svc = self._k8s_core.read_namespaced_service(name, ns)
             return svc.spec.cluster_ip
-        except ApiException:
+        except Exception:
             return None
 
     # ─── State machine transitions ──────────────────────────────────────

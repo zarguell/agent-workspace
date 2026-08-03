@@ -16,16 +16,18 @@
     display: flex; align-items: center; justify-content: space-between;
   }
   .header h1 { font-size: 1.25rem; color: #f1f5f9; }
-  .logout-btn {
+  .header .nav { display: flex; gap: 1rem; align-items: center; }
+  .nav a, .logout-btn {
     background: none; border: 1px solid #475569; color: #94a3b8;
-    padding: 0.375rem 0.75rem; border-radius: 6px; cursor: pointer; font-size: 0.8125rem;
+    padding: 0.375rem 0.75rem; border-radius: 6px; cursor: pointer;
+    font-size: 0.8125rem; text-decoration: none; display: inline-block;
   }
-  .logout-btn:hover { border-color: #64748b; color: #e2e8f0; }
+  .nav a:hover, .logout-btn:hover { border-color: #64748b; color: #e2e8f0; }
   .container { max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
   .card {
     background: #1e293b; border-radius: 10px; padding: 1.5rem;
     display: flex; align-items: center; justify-content: space-between;
-    margin-bottom: 1rem;
+    margin-bottom: 1rem; flex-wrap: wrap; gap: 0.75rem;
   }
   .card h2 { font-size: 1.125rem; margin-bottom: 0.25rem; }
   .card .meta { font-size: 0.8125rem; color: #64748b; }
@@ -36,7 +38,8 @@
   .badge.running { background: #065f46; color: #6ee7b7; }
   .badge.hibernated { background: #451a03; color: #fbbf24; }
   .badge.starting { background: #1e3a5f; color: #93c5fd; }
-  .actions { display: flex; gap: 0.5rem; }
+  .badge.shared { background: #312e81; color: #a5b4fc; }
+  .actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
   .btn {
     padding: 0.5rem 1rem; border: none; border-radius: 6px;
     font-size: 0.8125rem; font-weight: 500; cursor: pointer;
@@ -48,64 +51,222 @@
   .btn-secondary:hover { background: #475569; }
   .btn-warning { background: #92400e; color: #fde68a; }
   .btn-warning:hover { background: #b45309; }
+  .btn-danger { background: #7f1d1d; color: #fecaca; }
+  .btn-danger:hover { background: #991b1b; }
+  .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .loading { text-align: center; padding: 3rem; color: #64748b; }
   .error-card { background: #7f1d1d; border-radius: 10px; padding: 1.5rem; text-align: center; }
+  .share-panel {
+    flex-basis: 100%; border-top: 1px solid #334155; padding-top: 0.75rem;
+    font-size: 0.875rem;
+  }
+  .share-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.375rem 0;
+  }
+  .share-row .perm { color: #64748b; font-size: 0.75rem; }
+  .add-share { display: flex; gap: 0.5rem; margin-top: 0.5rem; flex-wrap: wrap; }
+  .add-share select {
+    padding: 0.375rem 0.5rem; border: 1px solid #334155; border-radius: 6px;
+    background: #0f172a; color: #e2e8f0; font-size: 0.8125rem; outline: none;
+  }
+  .toast {
+    position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
+    background: #065f46; color: #d1fae5; padding: 0.625rem 1.25rem;
+    border-radius: 8px; font-size: 0.875rem; display: none; z-index: 10;
+  }
 </style>
 </head>
 <body>
 <div class="header">
   <h1>Agent Workspaces</h1>
-  <button class="logout-btn" id="logout-btn">Sign Out</button>
+  <div class="nav">
+    <a href="/ui/groups">Groups</a>
+    <button class="logout-btn" id="logout-btn">Sign Out</button>
+  </div>
 </div>
 <div class="container" id="workspace-list">
   <div class="loading">Loading workspaces…</div>
 </div>
+<div class="toast" id="toast"></div>
 
 <script>
+let me = null; // current user id (from /api/session)
+
 async function logout() {
   await fetch("/api/logout", { method: "POST" });
   window.location.href = "/ui/login";
 }
 document.getElementById("logout-btn").addEventListener("click", logout);
 
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.style.display = "block";
+  setTimeout(() => { el.style.display = "none"; }, 2500);
+}
+
+async function api(path, opts) {
+  const resp = await fetch(path, opts);
+  if (resp.status === 401) { window.location.href = "/ui/login"; throw new Error("unauthorized"); }
+  return resp;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+// Select a workspace for /canvas/ and /code/: plain links can't set the
+// X-Workspace-Id header, so the gateway also honors this cookie.
+function openWorkspace(id, href) {
+  document.cookie = `workspace=${id}; path=/; max-age=21600`;
+  window.location.href = href;
+}
+
 async function loadWorkspaces() {
   const el = document.getElementById("workspace-list");
   try {
-    const resp = await fetch("/api/workspaces");
-    if (resp.status === 401) { window.location.href = "/ui/login"; return; }
-    if (!resp.ok) { throw new Error(await resp.text()); }
+    const sessionResp = await api("/api/session");
+    const session = await sessionResp.json();
+    me = session.user_id;
+
+    const resp = await api("/api/workspaces");
     const workspaces = await resp.json();
     if (workspaces.length === 0) {
       el.innerHTML = '<p style="text-align:center;color:#64748b">No workspaces found.</p>';
       return;
     }
-    el.innerHTML = workspaces.map(ws => {
-      const state = ws.state;
-      const badgeClass = { running: "running", starting: "starting", hibernated: "hibernated" }[state] || "";
-      return `<div class="card">
-        <div>
-          <h2>${ws.username || ws.workspace_id}</h2>
-          <div class="meta">
-            <span class="badge ${badgeClass}">${state}</span>
-            Created: ${new Date(ws.created_at).toLocaleString()}
-          </div>
-        </div>
-        <div class="actions">
-          ${state === "hibernated" ? `<button class="btn btn-primary" onclick="startWorkspace('${ws.workspace_id}')">Start</button>` : ""}
-          ${state === "running" ? `<a class="btn btn-primary" href="/canvas/">Open Canvas</a><a class="btn btn-secondary" href="/code/">Open Code</a>` : ""}
-          ${state === "starting" ? `<span class="btn btn-secondary" disabled>Starting…</span>` : ""}
-          ${state === "running" ? `<button class="btn btn-warning" onclick="hibernateWorkspace('${ws.workspace_id}')">Hibernate</button>` : ""}
-        </div>
-      </div>`;
-    }).join("");
+    el.innerHTML = "";
+    for (const ws of workspaces) {
+      el.appendChild(workspaceCard(ws));
+    }
   } catch (err) {
     el.innerHTML = `<div class="error-card">Failed to load workspaces: ${err.message}</div>`;
   }
 }
 
+function workspaceCard(ws) {
+  const state = ws.state;
+  const badgeClass = { running: "running", starting: "starting", hibernated: "hibernated" }[state] || "";
+  const isOwn = ws.user_id === me;
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `
+    <div>
+      <h2>${escapeHtml(ws.username || ws.workspace_id)}</h2>
+      <div class="meta">
+        <span class="badge ${badgeClass}">${state}</span>
+        ${isOwn ? "" : `<span class="badge shared">Shared</span>`}
+        <span>${ws.workspace_id}</span>
+        · Created: ${new Date(ws.created_at).toLocaleString()}
+      </div>
+    </div>
+    <div class="actions">
+      ${state === "hibernated" ? `<button class="btn btn-primary" onclick="startWorkspace('${ws.workspace_id}')">Start</button>` : ""}
+      ${state === "running" ? `<button class="btn btn-primary" onclick="openWorkspace('${ws.workspace_id}', '/canvas/')">Open Canvas</button><button class="btn btn-secondary" onclick="openWorkspace('${ws.workspace_id}', '/code/')">Open Code</button>` : ""}
+      ${state === "starting" ? `<span class="btn btn-secondary" disabled>Starting…</span>` : ""}
+      ${state === "running" ? `<button class="btn btn-warning" onclick="hibernateWorkspace('${ws.workspace_id}')">Hibernate</button>` : ""}
+      ${isOwn ? `<button class="btn btn-secondary" id="share-toggle-${ws.workspace_id}">Sharing</button>` : ""}
+    </div>
+    ${isOwn ? `<div class="share-panel" id="share-panel-${ws.workspace_id}" hidden>
+      <div id="share-rows-${ws.workspace_id}"></div>
+      <div class="add-share">
+        <select id="share-group-${ws.workspace_id}"></select>
+        <select id="share-perm-${ws.workspace_id}">
+          <option value="view">view</option>
+          <option value="operate">operate</option>
+        </select>
+        <button class="btn btn-secondary btn-sm" id="share-add-${ws.workspace_id}">Share</button>
+      </div>
+    </div>` : ""}`;
+
+  if (isOwn) {
+    const toggle = card.querySelector(`#share-toggle-${ws.workspace_id}`);
+    const panel = card.querySelector(`#share-panel-${ws.workspace_id}`);
+    toggle.addEventListener("click", async () => {
+      panel.hidden = !panel.hidden;
+      if (!panel.hidden) {
+        await loadShares(ws.workspace_id, card);
+        await loadShareGroups(ws.workspace_id, card);
+      }
+    });
+    card.querySelector(`#share-add-${ws.workspace_id}`).addEventListener("click", () => addShare(ws.workspace_id, card));
+  }
+  return card;
+}
+
+async function loadShares(id, card) {
+  const rows = card.querySelector(`#share-rows-${id}`);
+  try {
+    const resp = await api(`/api/workspaces/${id}/shares`);
+    const shares = await resp.json();
+    rows.innerHTML = "";
+    if (shares.length === 0) {
+      rows.innerHTML = '<span style="color:#64748b">Not shared with any group.</span>';
+      return;
+    }
+    for (const s of shares) {
+      const row = document.createElement("div");
+      row.className = "share-row";
+      row.innerHTML = `
+        <span>${escapeHtml(s.group_name)} <span class="perm">(${s.permission})</span></span>
+        <button class="btn btn-danger btn-sm" data-unshare="${s.group_id}">Unshare</button>`;
+      row.querySelector(`[data-unshare="${s.group_id}"]`).addEventListener("click", async () => {
+        await api(`/api/workspaces/${id}/shares/${s.group_id}`, { method: "DELETE" });
+        toast(`Unshared with ${s.group_name}`);
+        loadShares(id, card);
+      });
+      rows.appendChild(row);
+    }
+  } catch (err) {
+    rows.innerHTML = '<span class="perm">Could not load shares</span>';
+  }
+}
+
+async function loadShareGroups(id, card) {
+  const sel = card.querySelector(`#share-group-${id}`);
+  try {
+    const resp = await api("/api/groups");
+    const groups = await resp.json();
+    sel.innerHTML = "";
+    if (groups.length === 0) {
+      sel.innerHTML = '<option value="">No groups — create one first</option>';
+      return;
+    }
+    for (const g of groups) {
+      const opt = document.createElement("option");
+      opt.value = g.group_id;
+      opt.textContent = g.name;
+      sel.appendChild(opt);
+    }
+  } catch (err) {
+    sel.innerHTML = '<option value="">Could not load groups</option>';
+  }
+}
+
+async function addShare(id, card) {
+  const groupId = card.querySelector(`#share-group-${id}`).value;
+  if (!groupId) { toast("Create a group first"); return; }
+  const permission = card.querySelector(`#share-perm-${id}`).value;
+  const resp = await api(`/api/workspaces/${id}/shares`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ group_id: groupId, permission }),
+  });
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    toast(data.error || "Could not share");
+    return;
+  }
+  toast("Workspace shared");
+  loadShares(id, card);
+}
+
 async function startWorkspace(id) {
-  await fetch(`/api/workspaces/${id}/start`, { method: "POST" });
+  await api(`/api/workspaces/${id}/start`, { method: "POST" });
   // Poll workspace status every 3s until it transitions to running
   const poll = setInterval(async () => {
     try {
@@ -124,7 +285,7 @@ async function startWorkspace(id) {
 }
 
 async function hibernateWorkspace(id) {
-  await fetch(`/api/workspaces/${id}/hibernate`, { method: "POST" });
+  await api(`/api/workspaces/${id}/hibernate`, { method: "POST" });
   loadWorkspaces();
 }
 

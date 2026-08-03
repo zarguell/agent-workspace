@@ -404,7 +404,11 @@ async def path_proxy(request: Request, call_next):
         session = await validate_session(get_session_cookie(request))
         if not session:
             return RedirectResponse(url="/ui/login")
-        ws_override = request.headers.get("X-Workspace-Id") or None
+        ws_override = (
+            request.headers.get("X-Workspace-Id")
+            or request.cookies.get("workspace")
+            or None
+        )
         routing, ws_resp = await resolve_workspace(
             session["username"],
             get_session_cookie(request),
@@ -492,6 +496,7 @@ async def logout_proxy(request: Request):
     """Proxy logout to control plane."""
     return await proxy_http(request, CONTROL_PLANE_URL, strip_prefix="")
 
+
 # ─── Login page (served directly) ────────────────────────────────────
 
 @app.get("/ui/login")
@@ -501,13 +506,24 @@ async def login_page():
     return HTMLResponse(content=html)
 
 
-# ─── UI proxy — everything else under /ui/ goes to control plane ────
+# ─── UI pages (served directly by the gateway) ───────────────────────
 
 @app.get("/ui/workspaces")
 async def workspaces_page():
     """Serve the workspace manager HTML."""
     html = render_template("workspaces.html")
     return HTMLResponse(content=html)
+
+
+@app.get("/ui/groups")
+async def groups_page():
+    """Serve the group management HTML."""
+    html = render_template("groups.html")
+    return HTMLResponse(content=html)
+
+
+# ─── UI proxy — everything else under /ui/ goes to control plane ────
+
 
 
 @app.api_route("/ui/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])

@@ -244,3 +244,15 @@ async def test_running_stays_running_when_active(db, monkeypatch):
     rec, _, _, _ = make_reconciler(monkeypatch, ready)
     await rec._reconcile_workspace(ws)
     assert (await _fresh_workspace(db, "ws-active2")).state == "running"
+
+
+async def test_get_cluster_ip_resilient_without_k8s(monkeypatch):
+    """Routing must not 500 when the K8s client cannot initialize."""
+    from reconciler import Reconciler
+    rec = Reconciler()
+
+    def boom_init():
+        raise RuntimeError("no kubeconfig")
+
+    monkeypatch.setattr(rec, "_init_k8s", boom_init)
+    assert await rec._get_cluster_ip("some-user-id") is None
