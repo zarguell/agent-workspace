@@ -291,3 +291,19 @@ class SecretValueOut(SecretOut):
 
 class SecretUpsert(BaseModel):
     value: str = Field(max_length=8000)
+
+
+# ─── Network / egress control ───────────────────────────────────────
+
+NETWORK_MODES = ("open", "offline", "allowlist")
+
+
+class NetworkConfigOut(BaseModel):
+    workspace_id: str
+    mode: str
+    allowlist: list[str] = []
+
+
+class NetworkConfigUpdate(BaseModel):
+    mode: Optional[str] = Field(default=None, pattern="^(open|offline|allowlist)$")
+    allowlist: Optional[list[str]] = Field(default=None, max_length=50)

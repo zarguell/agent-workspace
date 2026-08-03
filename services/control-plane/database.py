@@ -45,5 +45,7 @@ async def init_db():
         for stmt in [
             "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS canvas_api_key VARCHAR(64)",
             "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS canvas_secret_key VARCHAR(64)",
+            "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS network_mode VARCHAR(20) DEFAULT 'open'",
+            "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS egress_allowlist JSONB DEFAULT '[]'::jsonb",
         ]:
             await conn.execute(text(stmt))

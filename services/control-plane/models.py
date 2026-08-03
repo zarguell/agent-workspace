@@ -86,6 +86,12 @@ class Workspace(Base):
     canvas_api_key = Column(String(64), nullable=False, default=_new_canvas_key)
     canvas_secret_key = Column(String(64), nullable=False, default=_new_canvas_key)
 
+    # Egress control: open (default), offline (no egress), or allowlist
+    # (DNS + platform services + explicit hosts/CIDRs only). Enforced by the
+    # reconciler's NetworkPolicy.
+    network_mode = Column(String(20), nullable=False, default="open")
+    egress_allowlist = Column(JSONB, nullable=False, default=list)
+
     __table_args__ = (
         CheckConstraint(
             state.in_([

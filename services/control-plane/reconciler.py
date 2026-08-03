@@ -5,13 +5,14 @@ and transitions workspace states.
 """
 
 import asyncio
+import ipaddress
 import logging
 import os
 import secrets
+import socket
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
-
 import httpx
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -330,35 +331,108 @@ class Reconciler:
 
     # ─── NetworkPolicy ──────────────────────────────────────────────────
 
-    def _ensure_network_policy(self, user_id: str):
+    def _ensure_network_policy(self, user_id: str, mode: str = "open", allowlist: Optional[list] = None):
+        """Apply the workspace's egress mode as a NetworkPolicy.
+
+        open      — deny ingress (platform only); egress unrestricted
+        offline   — deny ALL egress (and ingress as in open)
+        allowlist — deny egress except DNS, the platform namespace, and the
+                    configured hosts/CIDRs (hostnames resolved to IPs at
+                    apply time; self-heals on each reconcile)
+
+        Created on first pass; patched when the desired spec differs (e.g.
+        after a mode change on a running workspace).
+        """
         ns = _ns_name(user_id)
         name = "default-deny-ingress"
+        body = self._build_network_policy(name, mode, allowlist)
         try:
-            self._k8s_net.read_namespaced_network_policy(name, ns)
+            existing = self._k8s_net.read_namespaced_network_policy(name, ns)
+            if existing.to_dict().get("spec") != body.to_dict().get("spec"):
+                self._k8s_net.patch_namespaced_network_policy(name, ns, body)
+                logger.info("Patched NetworkPolicy %s in %s (mode=%s)", name, ns, mode)
+            return
         except ApiException as e:
             if e.status != 404:
                 raise
-            # Deny all ingress except from agent-platform namespace
-            body = client.V1NetworkPolicy(
-                metadata=client.V1ObjectMeta(name=name),
-                spec=client.V1NetworkPolicySpec(
-                    pod_selector=client.V1LabelSelector(),
-                    policy_types=["Ingress"],
-                    ingress=[
-                        client.V1NetworkPolicyIngressRule(
-                            _from=[
-                                client.V1NetworkPolicyPeer(
-                                    namespace_selector=client.V1LabelSelector(
-                                        match_labels={"kubernetes.io/metadata.name": "agent-platform"},
-                                    ),
-                                ),
-                            ],
-                        )
+        self._k8s_net.create_namespaced_network_policy(ns, body)
+        logger.info("Created NetworkPolicy %s in %s (mode=%s)", name, ns, mode)
+
+    def _build_network_policy(self, name: str, mode: str, allowlist: Optional[list]) -> client.V1NetworkPolicy:
+        """Build the desired NetworkPolicy for an egress mode."""
+        ingress = [
+            client.V1NetworkPolicyIngressRule(
+                _from=[
+                    client.V1NetworkPolicyPeer(
+                        namespace_selector=client.V1LabelSelector(
+                            match_labels={"kubernetes.io/metadata.name": "agent-platform"},
+                        ),
+                    ),
+                ],
+            )
+        ]
+        egress = None
+        policy_types = ["Ingress"]
+
+        if mode == "offline":
+            # Deny all egress: policy present with an empty egress list.
+            policy_types = ["Ingress", "Egress"]
+            egress = []
+        elif mode == "allowlist":
+            policy_types = ["Ingress", "Egress"]
+            egress = [
+                # Cluster DNS (kube-dns/coredns pods)
+                client.V1NetworkPolicyEgressRule(
+                    to=[
+                        client.V1NetworkPolicyPeer(
+                            pod_selector=client.V1LabelSelector(
+                                match_labels={"k8s-app": "kube-dns"},
+                            ),
+                        ),
+                    ],
+                    ports=[client.V1NetworkPolicyPort(port=53, protocol="UDP")],
+                ),
+                # Control plane + gateway (platform namespace)
+                client.V1NetworkPolicyEgressRule(
+                    to=[
+                        client.V1NetworkPolicyPeer(
+                            namespace_selector=client.V1LabelSelector(
+                                match_labels={"kubernetes.io/metadata.name": "agent-platform"},
+                            ),
+                        ),
                     ],
                 ),
-            )
-            self._k8s_net.create_namespaced_network_policy(ns, body)
-            logger.info("Created NetworkPolicy %s in %s", name, ns)
+            ]
+            for entry in allowlist or []:
+                entry = entry.strip()
+                try:
+                    ipaddress.ip_network(entry, strict=False)
+                    egress.append(client.V1NetworkPolicyEgressRule(
+                        to=[client.V1NetworkPolicyPeer(ip_block=client.V1IPBlock(cidr=entry))],
+                    ))
+                    continue
+                except ValueError:
+                    pass
+                # Hostname → current IPs (self-heals on next reconcile).
+                try:
+                    ips = {r[2] for r in socket.gethostbyname_ex(entry)[2]} | {socket.gethostbyname(entry)}
+                except Exception:
+                    logger.warning("Could not resolve allowlist host %s — skipping", entry)
+                    continue
+                for ip in ips:
+                    egress.append(client.V1NetworkPolicyEgressRule(
+                        to=[client.V1NetworkPolicyPeer(ip_block=client.V1IPBlock(cidr=f"{ip}/32"))],
+                    ))
+
+        return client.V1NetworkPolicy(
+            metadata=client.V1ObjectMeta(name=name),
+            spec=client.V1NetworkPolicySpec(
+                pod_selector=client.V1LabelSelector(),
+                policy_types=policy_types,
+                ingress=ingress,
+                egress=egress,
+            ),
+        )
 
     # ─── Pod readiness check ───────────────────────────────────────────
 
@@ -424,7 +498,7 @@ class Reconciler:
                 self._ensure_pvc(user_id)
                 self._ensure_service(user_id)
                 self._ensure_resource_quota(user_id)
-                self._ensure_network_policy(user_id)
+                self._ensure_network_policy(user_id, mode=ws.network_mode, allowlist=ws.egress_allowlist)
                 canvas_api_key = ws.canvas_api_key or _new_canvas_key()
                 canvas_secret_key = ws.canvas_secret_key or _new_canvas_key()
                 if not ws.canvas_api_key or not ws.canvas_secret_key:
@@ -493,6 +567,14 @@ class Reconciler:
                 logger.info("Workspace %s transitioned to running", ws.workspace_id)
 
         elif ws.state == "running":
+            # Keep the egress policy in sync with the configured mode (a mode
+            # change on a running workspace applies on the next pass).
+            try:
+                self._init_k8s()
+                self._ensure_network_policy(user_id, mode=ws.network_mode, allowlist=ws.egress_allowlist)
+            except Exception as e:
+                logger.error("Failed to update NetworkPolicy for %s: %s", ws.workspace_id, e)
+
             # Check idle timeout
             if ws.last_activity_at:
                 now = datetime.now(timezone.utc)

@@ -390,3 +390,30 @@ kubectl exec -i deploy/agent-platform-postgres -- psql -U agent -d agentplatform
 
 Encrypted secrets remain readable after restore only if `SECRETS_MASTER_KEY`
 is unchanged — the encrypted blobs are part of the dump.
+
+### Egress control (network modes)
+
+Each workspace has a network mode, enforced by the reconciler as a
+namespace NetworkPolicy (`default-deny-ingress`):
+
+| Mode | Egress |
+|---|---|
+| `open` (default) | Unrestricted; ingress denied except the platform namespace |
+| `offline` | Denied entirely (no DNS, no external network) |
+| `allowlist` | DNS (kube-dns) + the platform namespace + configured hosts/CIDRs |
+
+Set it per workspace (operate permission); the reconciler applies the
+change on its next pass, including on running workspaces (~30s):
+
+```bash
+curl -X PATCH /api/workspaces/<workspace_id>/network \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"allowlist","allowlist":["pypi.org","files.pythonhosted.org","10.0.0.0/8"]}'
+```
+
+Allowlist entries are CIDRs (used as-is) or hostnames (resolved to their
+current IPs at apply time; re-resolved on each reconcile so drift
+self-heals). The "offline + package cache" setup is: `mode: allowlist`
+with only your package proxy's CIDR/hostname — the agent reaches the
+cache and nothing else. For an agent that needs no network at all, use
+`mode: offline`.

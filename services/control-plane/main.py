@@ -34,6 +34,8 @@ from models import AuditEvent, Group, GroupMember, McpServer, Quota, Session, Us
 from reconciler import reconciler
 from secrets_store import decrypt_value, encrypt_value
 from schemas import (
+    NetworkConfigOut,
+    NetworkConfigUpdate,
     AddMemberRequest,
     AuditEventOut,
     AuditPage,
@@ -1119,8 +1121,86 @@ async def unshare_workspace(request: Request, workspace_id: str, group_id: str):
         await db.commit()
         return Ok().model_dump()
 
+# ─── Network / egress control ────────────────────────────────────────
+
+def _validate_allowlist(entries: list[str]) -> Optional[str]:
+    """Return an error message for the first invalid entry, else None."""
+    import ipaddress
+    for entry in entries:
+        entry = entry.strip()
+        if not entry:
+            return "allowlist entries must not be empty"
+        try:
+            ipaddress.ip_network(entry, strict=False)
+            continue
+        except ValueError:
+            pass
+        # Hostname: letters/digits/hyphens/dots, no scheme or port.
+        if not re.match(r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$", entry):
+            return f"invalid allowlist entry '{entry}' (expected CIDR or hostname)"
+    return None
+
+
+@app.get("/api/workspaces/{workspace_id}/network")
+async def get_network_config(request: Request, workspace_id: str):
+    """Read the workspace's egress mode and allowlist (view permission)."""
+    async with async_session_factory() as db:
+        ws = await _get_workspace_for_user(request, workspace_id, db)
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        return NetworkConfigOut(
+            workspace_id=workspace_id,
+            mode=ws.network_mode,
+            allowlist=ws.egress_allowlist or [],
+        ).model_dump()
+
+
+@app.patch("/api/workspaces/{workspace_id}/network")
+async def update_network_config(request: Request, workspace_id: str):
+    """Set the egress mode / allowlist (operate permission).
+
+    The reconciler applies the change on its next pass — including for
+    running workspaces, so a lockdown takes effect within ~30s.
+    """
+    body = await request.json()
+    try:
+        data = NetworkConfigUpdate(**body)
+    except Exception:
+        return JSONResponse(status_code=422, content=Error(error="Invalid request").model_dump())
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        ws = await _get_workspace_for_user(request, workspace_id, db)
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if not await _can_operate_workspace(request, ws, db):
+            return JSONResponse(status_code=403, content=Error(error="Insufficient permission").model_dump())
+
+        if data.mode is not None:
+            ws.network_mode = data.mode
+        if data.allowlist is not None:
+            err = _validate_allowlist(data.allowlist)
+            if err:
+                return JSONResponse(status_code=400, content=Error(error=err).model_dump())
+            ws.egress_allowlist = data.allowlist
+        await record_audit_event(
+            db, "workspace.network_changed",
+            actor_user_id=user_id,
+            workspace_id=workspace_id,
+            request_id=_get_request_id(request),
+            correlation_id=_get_correlation_id(request),
+            source_ip=_get_source_ip(request),
+            metadata={"mode": ws.network_mode, "allowlist": ws.egress_allowlist or []},
+        )
+        await db.commit()
+        return NetworkConfigOut(
+            workspace_id=workspace_id,
+            mode=ws.network_mode,
+            allowlist=ws.egress_allowlist or [],
+        ).model_dump()
+
 
 # ─── Workspace secrets ───────────────────────────────────────────────
+
 
 @app.get("/api/workspaces/{workspace_id}/secrets")
 async def list_workspace_secrets(request: Request, workspace_id: str):

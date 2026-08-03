@@ -42,8 +42,6 @@ class FakeAppsV1Api:
         else:
             self.patch_replicas.append(body.spec.replicas)
 
-    def delete_namespaced_deployment(self, name, namespace):
-        self.deployment_exists = False
 
 
 class FakeCoreV1Api:
@@ -64,11 +62,26 @@ class FakeCoreV1Api:
             return _record
         raise AttributeError(name)
 
-
 class FakeNetworkingV1Api(FakeCoreV1Api):
-    pass
+    """Stateful for network policies: read returns the stored policy once
+    created (so mode changes exercise the patch path)."""
 
+    def __init__(self):
+        super().__init__()
+        self._policy = None
 
+    def read_namespaced_network_policy(self, name, namespace):
+        if self._policy is None:
+            raise ApiException(status=404)
+        return self._policy
+
+    def create_namespaced_network_policy(self, namespace, body):
+        self._policy = body
+        self.created.append(("create_namespaced_network_policy", (namespace, body), {}))
+
+    def patch_namespaced_network_policy(self, name, namespace, body):
+        self._policy = body
+        self.created.append(("patch_namespaced_network_policy", (name, namespace, body), {}))
 def make_reconciler(monkeypatch, ready_holder):
     """Build a Reconciler wired to fakes; returns (rec, apps, core, net)."""
     from reconciler import Reconciler
@@ -166,8 +179,8 @@ async def test_canvas_keys_backfilled_and_injected_into_deployment(db, monkeypat
     # added them as nullable): raw SQL insert leaves them NULL.
     from sqlalchemy import text
     await db.execute(text(
-        "INSERT INTO workspaces (workspace_id, user_id, state, image, idle_timeout_minutes, created_at) "
-        "VALUES (:id, :uid, 'starting', '', 15, now())"
+        "INSERT INTO workspaces (workspace_id, user_id, state, image, idle_timeout_minutes, network_mode, egress_allowlist, created_at) "
+        "VALUES (:id, :uid, 'starting', '', 15, 'open', '[]'::jsonb, now())"
     ), {"id": ws_id, "uid": str(user.user_id)})
     await db.commit()
 
@@ -281,3 +294,66 @@ async def test_secrets_injected_as_env(db, monkeypatch):
     assert env["WS_SECRET_MY_TOKEN"] == "super-secret"
     assert env["WORKSPACE_ID"] == "ws-sec-user"
     assert env["USERNAME"] == "sec-user"
+
+
+async def test_network_policy_open_shape(db, monkeypatch):
+    rec, _, _, net = make_reconciler(monkeypatch, {"ready": False})
+    rec._init_k8s()
+    rec._ensure_network_policy("user-id-0001", mode="open", allowlist=None)
+
+    created = [c for c in net.created if c[0] == "create_namespaced_network_policy"]
+    assert len(created) == 1
+    spec = created[0][1][1].to_dict()["spec"]
+    assert spec["policy_types"] == ["Ingress"]
+    assert spec["egress"] is None  # egress unrestricted
+
+
+async def test_network_policy_offline_denies_egress(db, monkeypatch):
+    rec, _, _, net = make_reconciler(monkeypatch, {"ready": False})
+    rec._init_k8s()
+    rec._ensure_network_policy("user-id-0002", mode="offline", allowlist=None)
+
+    created = [c for c in net.created if c[0] == "create_namespaced_network_policy"]
+    spec = created[0][1][1].to_dict()["spec"]
+    assert spec["policy_types"] == ["Ingress", "Egress"]
+    assert spec["egress"] == []  # deny ALL egress
+
+
+async def test_network_policy_allowlist_shape(db, monkeypatch):
+    rec, _, _, net = make_reconciler(monkeypatch, {"ready": False})
+    rec._init_k8s()
+
+    # Deterministic hostname resolution for the allowlist entry.
+    from reconciler import socket as rec_socket
+    monkeypatch.setattr(rec_socket, "gethostbyname_ex", lambda h: (h, [], ["93.184.216.34"]))
+    monkeypatch.setattr(rec_socket, "gethostbyname", lambda h: "93.184.216.34")
+
+    rec._ensure_network_policy("user-id-0003", mode="allowlist", allowlist=["10.20.0.0/16", "pypi.org"])
+
+    created = [c for c in net.created if c[0] == "create_namespaced_network_policy"]
+    spec = created[0][1][1].to_dict()["spec"]
+    assert spec["policy_types"] == ["Ingress", "Egress"]
+
+    egress = spec["egress"]
+    assert egress[0]["to"][0]["pod_selector"]["match_labels"] == {"k8s-app": "kube-dns"}  # DNS
+    assert egress[0]["ports"][0]["port"] == 53
+    # platform namespace rule
+    assert egress[1]["to"][0]["namespace_selector"]["match_labels"] == {"kubernetes.io/metadata.name": "agent-platform"}
+    # explicit CIDR
+    assert any((e["to"][0].get("ip_block") or {}).get("cidr") == "10.20.0.0/16" for e in egress)
+    # resolved hostname IP
+    assert any((e["to"][0].get("ip_block") or {}).get("cidr") == "93.184.216.34/32" for e in egress)
+
+
+async def test_network_policy_patched_when_mode_changes(db, monkeypatch):
+    rec, _, _, net = make_reconciler(monkeypatch, {"ready": False})
+    rec._init_k8s()
+
+    # First pass creates; second pass with a different mode patches.
+    rec._ensure_network_policy("user-id-0004", mode="open", allowlist=None)
+    rec._ensure_network_policy("user-id-0004", mode="offline", allowlist=None)
+
+    created = [c for c in net.created if c[0] == "create_namespaced_network_policy"]
+    patched = [c for c in net.created if c[0] == "patch_namespaced_network_policy"]
+    assert len(created) == 1
+    assert len(patched) == 1
