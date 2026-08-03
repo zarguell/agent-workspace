@@ -15,7 +15,8 @@ RUN pip install --no-cache-dir \
     kubernetes \
     bcrypt \
     python-multipart \
-    cryptography
+    cryptography \
+    Authlib
 
 COPY . /app
 WORKDIR /app

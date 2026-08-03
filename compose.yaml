@@ -1,6 +1,6 @@
 name: agent-platform-local
 
-# Local development stack: Postgres + control plane + gateway.
+# Local development stack: Postgres + control plane + gateway + mock IdP.
 # No Kubernetes required. Workspace *pods* remain a K8s concept — to run the
 # full Canvas/code-server flow locally, point WORKSPACE_DEV_HOST at any
 # container exposing the workspace ports (6767/8080/8000/9000); the control
@@ -10,7 +10,9 @@ name: agent-platform-local
 #   open http://localhost:${GATEWAY_PORT:-18088}/ui/login
 #
 # Env overrides: SERVICE_AUTH_TOKEN, SEED_ADMIN_USER, SEED_ADMIN_PASSWORD,
-# WORKSPACE_DEV_HOST, CONTROL_PLANE_PORT, GATEWAY_PORT, POSTGRES_PORT.
+# WORKSPACE_DEV_HOST, CONTROL_PLANE_PORT, GATEWAY_PORT, POSTGRES_PORT,
+# OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_REDIRECT_URI,
+# OIDC_ADMIN_EMAILS.
 # (Set them in a .env file next to this file.)
 
 services:
@@ -42,6 +44,15 @@ services:
       # Fernet master key for workspace-secret encryption at rest. Change in
       # production; changing it makes existing secrets unreadable.
       SECRETS_MASTER_KEY: ${SECRETS_MASTER_KEY:-MnWVZmo5ijMYKILJWi-UxcsMiVLZIwVU8IZ_ixbVhrU=}
+      # OIDC SSO (optional). OIDC_ISSUER must be reachable from the BROWSER;
+      # OIDC_DISCOVERY_URL lets this container fetch discovery/tokens on a
+      # different URL (the mock-idp service on the compose network).
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://127.0.0.1:18099}
+      OIDC_DISCOVERY_URL: ${OIDC_DISCOVERY_URL:-http://mock-idp:18099/.well-known/openid-configuration}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-local-client}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-local-secret}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-http://agents.local.test:${GATEWAY_PORT:-18088}/api/oidc/callback}
+      OIDC_ADMIN_EMAILS: ${OIDC_ADMIN_EMAILS:-admin@example.com}
     ports:
       - "${CONTROL_PLANE_PORT:-18011}:80"
     depends_on:
@@ -52,6 +63,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+
   gateway:
     build: ./services/gateway
     environment:
@@ -69,6 +81,18 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+
+  # Mock OIDC identity provider for local SSO demos (scripts/mock-oidc-idp.py).
+  # Reuses the control-plane image (it ships uvicorn + joserfc + cryptography).
+  # The browser reaches it via the published port; the control plane reaches
+  # it as `mock-idp` on the compose network (OIDC_DISCOVERY_URL).
+  mock-idp:
+    image: agent-platform-local-control-plane
+    command: ["python", "/scripts/mock-oidc-idp.py", "--issuer", "http://127.0.0.1:18099", "--internal-base", "http://mock-idp:18099", "--port", "18099"]
+    volumes:
+      - ./scripts:/scripts:ro
+    ports:
+      - "18099:18099"
 
 volumes:
   pgdata:

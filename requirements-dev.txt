@@ -12,3 +12,4 @@ kubernetes
 jinja2
 websockets
 cryptography
+Authlib

@@ -16,14 +16,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 os.environ.setdefault("SERVICE_AUTH_TOKEN", "test-service-token")
+# Fixed Fernet key so encrypted secrets are readable across tests.
+os.environ.setdefault("SECRETS_MASTER_KEY", "Y8In5fgHjeCCJIB2Znv0OHOsFMHAW9vG844VH-L3Ass=")
 
 import httpx
 import pytest
 import pytest_asyncio
 
-os.environ.setdefault("SERVICE_AUTH_TOKEN", "test-service-token")
-# Fixed Fernet key so encrypted secrets are readable across tests.
-os.environ.setdefault("SECRETS_MASTER_KEY", "Y8In5fgHjeCCJIB2Znv0OHOsFMHAW9vG844VH-L3Ass=")
+
+# ─── DB fixture ─────────────────────────────────────────────────────────
 
 @pytest.fixture(scope="session")
 def postgres():
@@ -49,6 +50,8 @@ def postgres():
             os.environ["DATABASE_URL"] = old
         if container:
             container.stop()
+
+
 @pytest_asyncio.fixture
 async def db_ready(postgres):
     """Run the same init_db() the production lifespan runs.
@@ -56,7 +59,7 @@ async def db_ready(postgres):
     Import the models first so Base.metadata is populated before
     create_all — otherwise the metadata is empty and no tables appear.
     """
-    from models import AuditEvent, Session, User, Workspace  # noqa: F401 - register tables
+    from models import AuditEvent, Group, GroupMember, McpServer, Quota, Session, UsageEvent, User, Workspace, WorkspaceSecret, WorkspaceShare
     from database import init_db, engine
     await init_db()
     # Mirror the production migration state: the canvas-key columns were
@@ -69,6 +72,8 @@ async def db_ready(postgres):
             "ALTER TABLE workspaces ALTER COLUMN canvas_api_key DROP NOT NULL, "
             "ALTER COLUMN canvas_secret_key DROP NOT NULL"
         ))
+
+
 @pytest_asyncio.fixture
 async def db(db_ready):
     """Async session bound to the test database."""
@@ -108,6 +113,19 @@ async def _clear_idempotency():
     idempotency_store._store.clear()
     yield
     idempotency_store._store.clear()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_oidc_state():
+    """OIDC discovery/JWKS caches and the state store are process-global."""
+    import oidc
+    oidc._discovery_cache = None
+    oidc._jwks_cache = None
+    oidc._state_store.clear()
+    yield
+    oidc._discovery_cache = None
+    oidc._jwks_cache = None
+    oidc._state_store.clear()
 
 
 @pytest.fixture

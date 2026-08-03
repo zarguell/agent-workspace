@@ -51,9 +51,17 @@
     </div>
     <button type="submit" id="login-btn">Sign In</button>
     <div class="error" id="login-error"></div>
+    <div id="sso-row" style="display:none;margin-top:1rem;text-align:center">
+      <a id="sso-btn" href="/api/oidc/login" style="display:inline-block;width:100%;padding:0.625rem;border-radius:6px;background:#334155;color:#e2e8f0;font-size:0.9375rem;font-weight:600;text-decoration:none;box-sizing:border-box">Sign in with SSO</a>
+    </div>
   </form>
 </div>
 <script>
+// Show the SSO button when the control plane has OIDC configured.
+fetch("/api/oidc/config")
+  .then(r => r.json())
+  .then(cfg => { if (cfg.enabled) { document.getElementById("sso-row").style.display = "block"; } })
+  .catch(() => {});
 document.getElementById("login-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const btn = document.getElementById("login-btn");

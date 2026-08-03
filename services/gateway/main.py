@@ -662,7 +662,7 @@ async def resolve_and_proxy(request: Request, target_path: str) -> Response:
 async def api_proxy(request: Request, path: str):
     """Proxy API routes to the control plane."""
     session = await validate_session(get_session_cookie(request))
-    if not session and not path.startswith("health"):
+    if not session and not (path.startswith("health") or path.startswith("oidc")):
         return RedirectResponse(url="/ui/login")
     # Direct call to avoid proxy cookie forwarding issues
     async with httpx.AsyncClient() as c:

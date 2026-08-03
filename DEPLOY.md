@@ -172,6 +172,50 @@ values requires operate permission, listing names requires view.
 | `UV_CACHE_DIR` | `/opt/uv-cache` | uv cache path (baked into image at build; reused at runtime) |
 | `CONTROL_PLANE_URL` | `http://control-plane:80` | Where the workspace agent reports usage (injected into pods) |
 | `REPORT_INTERVAL` | `300` | Seconds between workspace-agent usage reports (compute + storage) |
+| `OIDC_ISSUER` | — | OIDC provider issuer URL (enables SSO when set with the client creds below) |
+| `OIDC_DISCOVERY_URL` | `<issuer>/.well-known/openid-configuration` | Where the control plane fetches the discovery document (override when the browser-facing issuer differs from the URL this container can reach) |
+| `OIDC_CLIENT_ID` | — | OIDC client ID registered with the provider |
+| `OIDC_CLIENT_SECRET` | — | OIDC client secret |
+| `OIDC_REDIRECT_URI` | — | Callback URL registered with the provider (e.g. `https://agents.example.com/api/oidc/callback`) |
+| `OIDC_ADMIN_EMAILS` | — | Comma-separated emails; matching SSO users are created as admins |
+| `OIDC_SCOPES` | `openid profile email` | Scopes requested from the provider |
+
+### Single sign-on (OIDC)
+
+SSO is implemented with Authlib (authorization-code flow + PKCE S256) and
+joserfc (ID-token verification against the provider's JWKS: RS256/384/512 and
+ES256/384/512 signatures, expiry, issuer, audience and nonce). It is generic
+and works with any provider that publishes an OIDC discovery document —
+Google, Microsoft Entra, Keycloak, Auth0, Okta, GitHub, GitLab, ...
+
+Enable it by setting `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`
+and `OIDC_REDIRECT_URI` on the control plane. The login page then shows a
+"Sign in with SSO" button.
+
+Provider setup:
+
+1. Register a public/confidential OAuth client with the provider.
+2. Set the redirect URI to `<platform-url>/api/oidc/callback` (e.g.
+   `https://agents.example.com/api/oidc/callback`) and authorize the
+   `openid`, `profile` and `email` scopes.
+3. Configure the control plane with the provider's issuer URL and the
+   client credentials.
+
+On first sign-in the control plane provisions the platform user from the
+ID-token claims (`sub` is the stable key; the username is derived from
+`preferred_username` or the email local-part) and auto-creates their
+workspace, matching local-login behavior. Users whose email appears in
+`OIDC_ADMIN_EMAILS` are provisioned as admins. Repeated sign-ins reuse the
+same account; password login is untouched and can stay enabled alongside
+SSO.
+
+OIDC discovery is fetched from `OIDC_DISCOVERY_URL` (default:
+`OIDC_ISSUER + "/.well-known/openid-configuration"`). Set it explicitly when
+the issuer is only reachable from the browser but the discovery/token
+endpoints must be fetched over a different URL — the included mock IdP
+(`scripts/mock-oidc-idp.py`, wired into the compose stack) is one such case:
+the browser uses `http://127.0.0.1:18099` while the control plane reaches
+the provider as `mock-idp` on the compose network.
 
 ### Workspace persistence
 

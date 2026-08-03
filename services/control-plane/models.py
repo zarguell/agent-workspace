@@ -38,7 +38,6 @@ def _new_canvas_key():
 
 class User(Base):
     __tablename__ = "users"
-
     user_id = Column(UUID(as_uuid=False), primary_key=True, default=_new_uuid)
     username = Column(String(255), unique=True, nullable=False, index=True)
     password_hash = Column(Text, nullable=False)
@@ -46,6 +45,8 @@ class User(Base):
     is_admin = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
     disabled_at = Column(DateTime(timezone=True), nullable=True)
+    # OIDC subject (SSO identity); NULL for local accounts.
+    oidc_sub = Column(String(255), unique=True, nullable=True, index=True)
 
     sessions = relationship("Session", back_populates="user", cascade="all, delete-orphan")
     workspace = relationship("Workspace", back_populates="user", uselist=False, cascade="all, delete-orphan")

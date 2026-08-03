@@ -31,6 +31,7 @@ from auth import (
 from database import async_session_factory, get_session, init_db
 from idempotency import idempotency_store
 from models import AuditEvent, Group, GroupMember, McpServer, Quota, Session, UsageEvent, User, Workspace, WorkspaceSecret, WorkspaceShare
+from oidc import router as oidc_router
 from reconciler import reconciler
 from secrets_store import decrypt_value, encrypt_value
 from schemas import (
@@ -127,6 +128,8 @@ async def lifespan(app: FastAPI):
     logger.info("Control-plane service stopped")
 
 
+
+
 app = FastAPI(
     title="Agent Workspace Control Plane",
     version="0.2.0",
@@ -134,6 +137,7 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
+app.include_router(oidc_router)
 
 # CORS — allow gateway to forward requests
 app.add_middleware(
@@ -145,10 +149,12 @@ app.add_middleware(
 )
 
 
+
+
 # ─── Middleware: Session Auth ──────────────────────────────────────────
 
 SESSION_COOKIE_NAME = "session"
-SESSION_EXEMPT_PATHS = {"/api/login", "/api/health"}
+SESSION_EXEMPT_PATHS = {"/api/login", "/api/health", "/api/oidc/login", "/api/oidc/callback", "/api/oidc/config"}
 
 
 @app.middleware("http")

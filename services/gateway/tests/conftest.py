@@ -75,6 +75,11 @@ def _handler(request: httpx.Request) -> httpx.Response:
                     return httpx.Response(200, json=session)
             return httpx.Response(401, json={"error": "No valid session"})
 
+        if request.method == "GET" and path == "/api/oidc/config":
+            return httpx.Response(200, json={"enabled": False, "issuer": None})
+        if request.method == "GET" and path == "/api/oidc/callback":
+            return httpx.Response(400, json={"error": "Invalid state"})
+
         if request.method == "GET" and path.startswith("/api/internal/workspaces/") and path.endswith("/routing"):
             ws_id = path.split("/")[4]
             service_user = request.headers.get("x-service-user", "")

@@ -47,5 +47,9 @@ async def init_db():
             "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS canvas_secret_key VARCHAR(64)",
             "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS network_mode VARCHAR(20) DEFAULT 'open'",
             "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS egress_allowlist JSONB DEFAULT '[]'::jsonb",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_sub VARCHAR(255)",
         ]:
             await conn.execute(text(stmt))
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_oidc_sub ON users (oidc_sub)"
+        ))
