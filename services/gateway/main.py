@@ -39,6 +39,13 @@ _ACTIVITY_THROTTLE_SECONDS = 60.0
 _ACTIVITY_PRUNE_SECONDS = 3600.0
 _LAST_ACTIVITY_TOUCH: dict[str, float] = {}
 
+# Wake single-flight: at most one /start POST per workspace in flight, and no
+# more than one per workspace per window — a browser auto-refreshing the wake
+# page can't pile concurrent start requests onto the control plane.
+_WAKE_TRIGGER_MIN_INTERVAL_S = 5.0
+_WAKE_TRIGGERS_IN_FLIGHT: dict[str, asyncio.Task] = {}
+_LAST_WAKE_TRIGGER_AT: dict[str, float] = {}
+
 # ─── Template engine ─────────────────────────────────────────────────────
 
 TEMPLATES = Environment(loader=FileSystemLoader("templates"))
@@ -142,6 +149,32 @@ async def trigger_start(workspace_id: str, session_cookie: str | None = None) ->
         return resp.status_code in (200, 202)
     except httpx.HTTPError:
         return False
+
+
+def _maybe_wake_workspace(workspace_id: str, session_cookie: str | None = None) -> None:
+    """Single-flight, throttled wake trigger.
+
+    Fires at most one /start POST per workspace at a time, and at most once
+    per ``_WAKE_TRIGGER_MIN_INTERVAL_S`` window. A skipped wake behaves
+    exactly as if the trigger were already in progress — the caller shows
+    the starting page either way.
+    """
+    now = time.monotonic()
+    if workspace_id in _WAKE_TRIGGERS_IN_FLIGHT:
+        return
+    if now - _LAST_WAKE_TRIGGER_AT.get(workspace_id, 0.0) < _WAKE_TRIGGER_MIN_INTERVAL_S:
+        return
+    task = asyncio.ensure_future(_wake_trigger(workspace_id, session_cookie))
+    _WAKE_TRIGGERS_IN_FLIGHT[workspace_id] = task
+    _LAST_WAKE_TRIGGER_AT[workspace_id] = now
+
+
+async def _wake_trigger(workspace_id: str, session_cookie: str | None) -> None:
+    """Run one throttled wake trigger, clearing the in-flight marker."""
+    try:
+        await trigger_start(workspace_id, session_cookie)
+    finally:
+        _WAKE_TRIGGERS_IN_FLIGHT.pop(workspace_id, None)
 
 
 async def record_audit(event_type: str, metadata: dict | None = None) -> None:
@@ -493,7 +526,7 @@ async def resolve_workspace(
 
     # Hibernated / requested / failed → trigger a start, show starting page
     if state in ("hibernated", "requested", "failed"):
-        await trigger_start(workspace_id, session_cookie)
+        _maybe_wake_workspace(workspace_id, session_cookie)
         return None, HTMLResponse(
             content=render_template("starting.html"),
             status_code=200,

@@ -162,6 +162,10 @@ def _reset_mocks():
     try:
         import main as _gw
         _gw._LAST_ACTIVITY_TOUCH.clear()
+        for _task in list(_gw._WAKE_TRIGGERS_IN_FLIGHT.values()):
+            _task.cancel()
+        _gw._WAKE_TRIGGERS_IN_FLIGHT.clear()
+        _gw._LAST_WAKE_TRIGGER_AT.clear()
     except ImportError:
         pass  # main not imported yet — nothing to reset
     yield
