@@ -21,8 +21,9 @@ import httpx
 import pytest
 import pytest_asyncio
 
-
-# ─── DB fixture ─────────────────────────────────────────────────────────
+os.environ.setdefault("SERVICE_AUTH_TOKEN", "test-service-token")
+# Fixed Fernet key so encrypted secrets are readable across tests.
+os.environ.setdefault("SECRETS_MASTER_KEY", "Y8In5fgHjeCCJIB2Znv0OHOsFMHAW9vG844VH-L3Ass=")
 
 @pytest.fixture(scope="session")
 def postgres():

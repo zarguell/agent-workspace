@@ -133,6 +133,26 @@ The gateway strips the `/mcp/{server_id}` prefix before forwarding, so
 sub-paths like `/mcp/{server_id}/messages` reach the server as `/messages`.
 Disable a server to take it offline without unregistering.
 
+### Workspace secrets
+
+Per-workspace secrets are stored **encrypted at rest** (Fernet) and injected
+into workspace pods as `WS_SECRET_<KEY>` environment variables when the pod
+is created. Set the master key or existing secrets become unreadable:
+
+| Variable | Default | Description |
+|---|---|---|
+| `SECRETS_MASTER_KEY` | (ephemeral, with warning) | Fernet key for secret encryption; must be 32 url-safe base64 bytes |
+
+Manage secrets via the workspaces page ("Secrets" panel) or the API:
+
+```bash
+curl -X PUT /api/workspaces/<workspace_id>/secrets/GITHUB_TOKEN \
+  -H "Content-Type: application/json" -d '{"value":"ghp_..."}'
+```
+
+Keys must match `[A-Za-z0-9_-]` (uppercased for the env var name); reading
+values requires operate permission, listing names requires view.
+
 
 
 

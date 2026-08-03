@@ -257,3 +257,25 @@ async def test_get_cluster_ip_resilient_without_k8s(monkeypatch):
 
     monkeypatch.setattr(rec, "_init_k8s", boom_init)
     assert await rec._get_cluster_ip("some-user-id") is None
+
+
+async def test_secrets_injected_as_env(db, monkeypatch):
+    user = await seed_user("sec-user", create_workspace=False)
+    ws = await _insert_workspace(db, user, "ws-sec-user", "starting")
+
+    from models import WorkspaceSecret
+    from secrets_store import encrypt_value
+    db.add(WorkspaceSecret(
+        workspace_id="ws-sec-user",
+        key="my_token",
+        value_encrypted=encrypt_value("super-secret"),
+        created_by=user.user_id,
+    ))
+    await db.commit()
+
+    ready = {"ready": False}
+    rec, apps, _, _ = make_reconciler(monkeypatch, ready)
+    await rec._reconcile_workspace(ws)
+
+    env = _deploy_env(apps)
+    assert env["WS_SECRET_MY_TOKEN"] == "super-secret"

@@ -272,3 +272,22 @@ class McpTargetOut(BaseModel):
     name: str
     port: int
     enabled: bool
+
+
+# ─── Workspace secrets ───────────────────────────────────────────────
+
+SECRET_KEY_RE = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$"
+
+
+class SecretOut(BaseModel):
+    workspace_id: str
+    key: str
+    updated_at: datetime
+
+
+class SecretValueOut(SecretOut):
+    value: str
+
+
+class SecretUpsert(BaseModel):
+    value: str = Field(max_length=8000)

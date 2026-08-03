@@ -171,7 +171,7 @@ function workspaceCard(ws) {
       ${state === "running" ? `<button class="btn btn-primary" onclick="openWorkspace('${ws.workspace_id}', '/canvas/')">Open Canvas</button><button class="btn btn-secondary" onclick="openWorkspace('${ws.workspace_id}', '/code/')">Open Code</button>` : ""}
       ${state === "starting" ? `<span class="btn btn-secondary" disabled>Starting…</span>` : ""}
       ${state === "running" ? `<button class="btn btn-warning" onclick="hibernateWorkspace('${ws.workspace_id}')">Hibernate</button>` : ""}
-      ${isOwn ? `<button class="btn btn-secondary" id="share-toggle-${ws.workspace_id}">Sharing</button><button class="btn btn-secondary" id="mcp-toggle-${ws.workspace_id}">MCP Servers</button>` : ""}
+      ${isOwn ? `<button class="btn btn-secondary" id="share-toggle-${ws.workspace_id}">Sharing</button><button class="btn btn-secondary" id="mcp-toggle-${ws.workspace_id}">MCP Servers</button><button class="btn btn-secondary" id="secrets-toggle-${ws.workspace_id}">Secrets</button>` : ""}
     </div>
     ${isOwn ? `<div class="share-panel" id="mcp-panel-${ws.workspace_id}" hidden>
       <div id="mcp-rows-${ws.workspace_id}"></div>
@@ -179,6 +179,14 @@ function workspaceCard(ws) {
         <input type="text" id="mcp-name-${ws.workspace_id}" placeholder="name" style="padding:0.375rem 0.5rem;border:1px solid #334155;border-radius:6px;background:#0f172a;color:#e2e8f0;font-size:0.8125rem">
         <input type="number" id="mcp-port-${ws.workspace_id}" placeholder="port" min="1" max="65535" value="3001" style="width:5rem;padding:0.375rem 0.5rem;border:1px solid #334155;border-radius:6px;background:#0f172a;color:#e2e8f0;font-size:0.8125rem">
         <button class="btn btn-secondary btn-sm" id="mcp-add-${ws.workspace_id}">Register</button>
+      </div>
+    </div>` : ""}
+    ${isOwn ? `<div class="share-panel" id="secrets-panel-${ws.workspace_id}" hidden>
+      <div id="secrets-rows-${ws.workspace_id}"></div>
+      <div class="add-share">
+        <input type="text" id="secrets-key-${ws.workspace_id}" placeholder="key (e.g. GITHUB_TOKEN)" style="padding:0.375rem 0.5rem;border:1px solid #334155;border-radius:6px;background:#0f172a;color:#e2e8f0;font-size:0.8125rem">
+        <input type="password" id="secrets-value-${ws.workspace_id}" placeholder="value" style="padding:0.375rem 0.5rem;border:1px solid #334155;border-radius:6px;background:#0f172a;color:#e2e8f0;font-size:0.8125rem;flex:1">
+        <button class="btn btn-secondary btn-sm" id="secrets-add-${ws.workspace_id}">Save</button>
       </div>
     </div>` : ""}
     ${isOwn ? `<div class="share-panel" id="share-panel-${ws.workspace_id}" hidden>
@@ -214,8 +222,66 @@ function workspaceCard(ws) {
       }
     });
     card.querySelector(`#mcp-add-${ws.workspace_id}`).addEventListener("click", () => addMcpServer(ws.workspace_id, card));
+
+    const secretsToggle = card.querySelector(`#secrets-toggle-${ws.workspace_id}`);
+    const secretsPanel = card.querySelector(`#secrets-panel-${ws.workspace_id}`);
+    secretsToggle.addEventListener("click", async () => {
+      secretsPanel.hidden = !secretsPanel.hidden;
+      if (!secretsPanel.hidden) {
+        await loadSecrets(ws.workspace_id, card);
+      }
+    });
+    card.querySelector(`#secrets-add-${ws.workspace_id}`).addEventListener("click", () => addSecret(ws.workspace_id, card));
   }
   return card;
+}
+
+async function loadSecrets(id, card) {
+  const rows = card.querySelector(`#secrets-rows-${id}`);
+  try {
+    const resp = await api(`/api/workspaces/${id}/secrets`);
+    const secrets = await resp.json();
+    rows.innerHTML = "";
+    if (secrets.length === 0) {
+      rows.innerHTML = '<span style="color:#64748b">No secrets set.</span>';
+      return;
+    }
+    for (const s of secrets) {
+      const row = document.createElement("div");
+      row.className = "share-row";
+      row.innerHTML = `
+        <span>${escapeHtml(s.key)}</span>
+        <button class="btn btn-danger btn-sm" data-secret-remove="${s.key}">Remove</button>`;
+      row.querySelector(`[data-secret-remove="${s.key}"]`).addEventListener("click", async () => {
+        await api(`/api/workspaces/${id}/secrets/${encodeURIComponent(s.key)}`, { method: "DELETE" });
+        toast(`Secret ${s.key} removed`);
+        loadSecrets(id, card);
+      });
+      rows.appendChild(row);
+    }
+  } catch (err) {
+    rows.innerHTML = '<span class="perm">Could not load secrets</span>';
+  }
+}
+
+async function addSecret(id, card) {
+  const key = card.querySelector(`#secrets-key-${id}`).value.trim();
+  const value = card.querySelector(`#secrets-value-${id}`).value;
+  if (!key || !value) { toast("Key and value required"); return; }
+  const resp = await api(`/api/workspaces/${id}/secrets/${encodeURIComponent(key)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ value }),
+  });
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    toast(data.error || "Could not save secret");
+    return;
+  }
+  card.querySelector(`#secrets-key-${id}`).value = "";
+  card.querySelector(`#secrets-value-${id}`).value = "";
+  toast(`Secret ${key} saved`);
+  loadSecrets(id, card);
 }
 
 async function loadMcpServers(id, card) {

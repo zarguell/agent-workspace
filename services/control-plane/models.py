@@ -240,3 +240,29 @@ class McpServer(Base):
         nullable=False,
     )
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+class WorkspaceSecret(Base):
+    """Per-workspace secret, encrypted at rest (Fernet, SECRETS_MASTER_KEY).
+
+    Values are injected into workspace pods as WS_SECRET_<KEY> env vars by
+    the reconciler. Only the encrypted blob is stored in Postgres.
+    """
+
+    __tablename__ = "workspace_secrets"
+    __table_args__ = (UniqueConstraint("workspace_id", "key"),)
+
+    workspace_id = Column(
+        String(255),
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    key = Column(String(255), primary_key=True)
+    value_encrypted = Column(Text, nullable=False)
+    created_by = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)

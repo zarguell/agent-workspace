@@ -8,6 +8,7 @@ import json
 import logging
 import asyncio
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -29,8 +30,9 @@ from auth import (
 )
 from database import async_session_factory, get_session, init_db
 from idempotency import idempotency_store
-from models import AuditEvent, Group, GroupMember, McpServer, Quota, Session, UsageEvent, User, Workspace, WorkspaceShare
+from models import AuditEvent, Group, GroupMember, McpServer, Quota, Session, UsageEvent, User, Workspace, WorkspaceSecret, WorkspaceShare
 from reconciler import reconciler
+from secrets_store import decrypt_value, encrypt_value
 from schemas import (
     AddMemberRequest,
     AuditEventOut,
@@ -50,6 +52,10 @@ from schemas import (
     Operation,
     QuotaOut,
     QuotaUpdate,
+    SECRET_KEY_RE,
+    SecretOut,
+    SecretUpsert,
+    SecretValueOut,
     SessionOut,
     ShareOut,
     ShareRequest,
@@ -1109,6 +1115,129 @@ async def unshare_workspace(request: Request, workspace_id: str, group_id: str):
             correlation_id=_get_correlation_id(request),
             source_ip=_get_source_ip(request),
             metadata={"group_id": group_id},
+        )
+        await db.commit()
+        return Ok().model_dump()
+
+
+# ─── Workspace secrets ───────────────────────────────────────────────
+
+@app.get("/api/workspaces/{workspace_id}/secrets")
+async def list_workspace_secrets(request: Request, workspace_id: str):
+    """List secret keys (names only). View permission is enough."""
+    async with async_session_factory() as db:
+        ws = await _get_workspace_for_user(request, workspace_id, db)
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        result = await db.execute(
+            select(WorkspaceSecret)
+            .where(WorkspaceSecret.workspace_id == workspace_id)
+            .order_by(WorkspaceSecret.key)
+        )
+        return [
+            SecretOut(
+                workspace_id=s.workspace_id,
+                key=s.key,
+                updated_at=s.updated_at,
+            ).model_dump()
+            for s in result.scalars().all()
+        ]
+
+
+@app.get("/api/workspaces/{workspace_id}/secrets/{key}")
+async def get_workspace_secret(request: Request, workspace_id: str, key: str):
+    """Read a secret's decrypted value (operate permission)."""
+    async with async_session_factory() as db:
+        ws = await _get_workspace_for_user(request, workspace_id, db)
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if not await _can_operate_workspace(request, ws, db):
+            return JSONResponse(status_code=403, content=Error(error="Insufficient permission").model_dump())
+        secret = await db.get(WorkspaceSecret, {"workspace_id": workspace_id, "key": key})
+        if secret is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        return SecretValueOut(
+            workspace_id=workspace_id,
+            key=key,
+            value=decrypt_value(secret.value_encrypted),
+            updated_at=secret.updated_at,
+        ).model_dump()
+
+
+@app.put("/api/workspaces/{workspace_id}/secrets/{key}")
+async def upsert_workspace_secret(request: Request, workspace_id: str, key: str):
+    """Create or update a secret (operate permission). Encrypted at rest."""
+    if not re.match(SECRET_KEY_RE, key):
+        return JSONResponse(status_code=400, content=Error(error="Invalid secret key: use [A-Za-z0-9_-]").model_dump())
+    body = await request.json()
+    data = SecretUpsert(**body)
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        ws = await _get_workspace_for_user(request, workspace_id, db)
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if not await _can_operate_workspace(request, ws, db):
+            return JSONResponse(status_code=403, content=Error(error="Insufficient permission").model_dump())
+
+        encrypted = encrypt_value(data.value)
+        secret = await db.get(WorkspaceSecret, {"workspace_id": workspace_id, "key": key})
+        if secret is None:
+            secret = WorkspaceSecret(
+                workspace_id=workspace_id,
+                key=key,
+                value_encrypted=encrypted,
+                created_by=user_id,
+            )
+            db.add(secret)
+            await record_audit_event(
+                db, "workspace.secret_set",
+                actor_user_id=user_id,
+                workspace_id=workspace_id,
+                request_id=_get_request_id(request),
+                correlation_id=_get_correlation_id(request),
+                source_ip=_get_source_ip(request),
+                metadata={"key": key, "created": True},
+            )
+        else:
+            secret.value_encrypted = encrypted
+            await record_audit_event(
+                db, "workspace.secret_set",
+                actor_user_id=user_id,
+                workspace_id=workspace_id,
+                request_id=_get_request_id(request),
+                correlation_id=_get_correlation_id(request),
+                source_ip=_get_source_ip(request),
+                metadata={"key": key, "created": False},
+            )
+        await db.commit()
+        return SecretOut(
+            workspace_id=workspace_id,
+            key=key,
+            updated_at=secret.updated_at,
+        ).model_dump()
+
+
+@app.delete("/api/workspaces/{workspace_id}/secrets/{key}")
+async def delete_workspace_secret(request: Request, workspace_id: str, key: str):
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        ws = await _get_workspace_for_user(request, workspace_id, db)
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        if not await _can_operate_workspace(request, ws, db):
+            return JSONResponse(status_code=403, content=Error(error="Insufficient permission").model_dump())
+        secret = await db.get(WorkspaceSecret, {"workspace_id": workspace_id, "key": key})
+        if secret is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        await db.delete(secret)
+        await record_audit_event(
+            db, "workspace.secret_deleted",
+            actor_user_id=user_id,
+            workspace_id=workspace_id,
+            request_id=_get_request_id(request),
+            correlation_id=_get_correlation_id(request),
+            source_ip=_get_source_ip(request),
+            metadata={"key": key},
         )
         await db.commit()
         return Ok().model_dump()

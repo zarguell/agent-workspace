@@ -39,6 +39,9 @@ services:
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-admin}
       DISABLE_RECONCILER: "1"
       WORKSPACE_DEV_HOST: ${WORKSPACE_DEV_HOST:-}
+      # Fernet master key for workspace-secret encryption at rest. Change in
+      # production; changing it makes existing secrets unreadable.
+      SECRETS_MASTER_KEY: ${SECRETS_MASTER_KEY:-MnWVZmo5ijMYKILJWi-UxcsMiVLZIwVU8IZ_ixbVhrU=}
     ports:
       - "${CONTROL_PLANE_PORT:-18011}:80"
     depends_on:
@@ -49,7 +52,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-
   gateway:
     build: ./services/gateway
     environment:

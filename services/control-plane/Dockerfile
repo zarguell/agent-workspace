@@ -14,7 +14,8 @@ RUN pip install --no-cache-dir \
     httpx \
     kubernetes \
     bcrypt \
-    python-multipart
+    python-multipart \
+    cryptography
 
 COPY . /app
 WORKDIR /app

@@ -20,7 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from audit import record_audit_event
 from database import async_session_factory
-from models import Workspace
+from models import Workspace, WorkspaceSecret
+from secrets_store import decrypt_value
 
 logger = logging.getLogger("control-plane.reconciler")
 
@@ -192,6 +193,7 @@ class Reconciler:
         replicas: int = 1,
         canvas_api_key: str = "",
         canvas_secret_key: str = "",
+        extra_env: Optional[list] = None,
     ):
         ns = _ns_name(user_id)
         name = _deploy_name(user_id)
@@ -235,7 +237,7 @@ class Reconciler:
                         client.V1EnvVar(name="LOCAL_BACKEND_API_KEY", value=canvas_api_key),
                         client.V1EnvVar(name="OH_SECRET_KEY", value=canvas_secret_key),
                         client.V1EnvVar(name="SERVICE_AUTH_TOKEN", value=SERVICE_AUTH_TOKEN),
-                    ],
+                    ] + (extra_env or []),
                     resources=client.V1ResourceRequirements(
                         requests={"cpu": "512m", "memory": "1Gi"},
                         limits={"cpu": "2", "memory": "4Gi"},
@@ -438,12 +440,24 @@ class Reconciler:
                         )
                         await db.commit()
                     logger.info("Persisted Canvas keys for workspace %s", ws.workspace_id)
+                # Workspace secrets → WS_SECRET_<KEY> env vars
+                secret_env: list = []
+                async with async_session_factory() as db:
+                    result = await db.execute(
+                        select(WorkspaceSecret).where(WorkspaceSecret.workspace_id == ws.workspace_id)
+                    )
+                    for s in result.scalars().all():
+                        secret_env.append(client.V1EnvVar(
+                            name=f"WS_SECRET_{s.key.upper()}",
+                            value=decrypt_value(s.value_encrypted),
+                        ))
                 self._ensure_deployment(
                     user_id,
                     ws.image or WORKSPACE_IMAGE,
                     replicas=1,
                     canvas_api_key=canvas_api_key,
                     canvas_secret_key=canvas_secret_key,
+                    extra_env=secret_env,
                 )
             except Exception as e:
                 logger.error("Failed to create K8s resources for workspace %s: %s", ws.workspace_id, e)
