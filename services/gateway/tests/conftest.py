@@ -14,6 +14,7 @@ the relative path "templates".
 """
 
 import os
+import gzip
 import sys
 from pathlib import Path
 
@@ -43,9 +44,15 @@ MCP_RESPONSE = {
     "result": {"tools": [{"name": "demo", "description": "demo tool"}]},
 }
 
+# Per-test upstream knobs (all reset to these defaults by the autouse fixture).
+_gzip_config = {"upstream_html": False}
+_redirect_config = {"location": None}
+_login_config = {"set_cookie": "session=abc; Path=/; HttpOnly"}
+_user_config = {"set_cookie": "workspace=ws-alice; Path=/; HttpOnly"}
+
 # Mutable per-test state read by the mock handler.
 _requests_log: list = []
-_routing_config = {"state": "running", "agent_ready": True, "cluster_ip": CLUSTER_IP}
+_routing_config = {"state": "running", "agent_ready": True, "cluster_ip": CLUSTER_IP, "agent_token": "tok-alice"}
 
 # Session cookie marker → session dict.
 _SESSIONS = {
@@ -90,7 +97,8 @@ def _handler(request: httpx.Request) -> httpx.Response:
                 "state": _routing_config["state"],
                 "cluster_ip": _routing_config["cluster_ip"],
                 "agent_ready": _routing_config["agent_ready"],
-                "exposures": [],
+                "agent_token": _routing_config["agent_token"],
+                "exposures": [{"id": "exp-1", "port": 3000}],
             })
 
         if request.method == "GET" and path.startswith("/api/internal/workspaces/") and "/mcp/" in path:
@@ -110,6 +118,12 @@ def _handler(request: httpx.Request) -> httpx.Response:
                 })
             return httpx.Response(404, json={"error": "Not found"})
 
+        if request.method == "POST" and path == "/api/internal/activity":
+            return httpx.Response(204)
+        if request.method == "POST" and path == "/api/login":
+            return httpx.Response(200, json={"ok": True}, headers={"set-cookie": _login_config["set_cookie"]})
+        if request.method == "GET" and path == "/api/user":
+            return httpx.Response(200, json={"user": "alice"}, headers={"set-cookie": _user_config["set_cookie"]})
         if request.method == "POST" and path.startswith("/api/workspaces/") and path.endswith("/start"):
             return httpx.Response(202, json={
                 "workspace_id": path.split("/")[3],
@@ -122,6 +136,16 @@ def _handler(request: httpx.Request) -> httpx.Response:
     if url.host == CLUSTER_IP:
         if url.port == 3001:
             return httpx.Response(200, json=MCP_RESPONSE, headers={"content-type": "application/json"})
+        if _redirect_config["location"]:
+            return httpx.Response(302, headers={"location": _redirect_config["location"]})
+        if url.path == "/password":
+            return httpx.Response(200, json={"password": "paseo-secret"})
+        if _gzip_config["upstream_html"]:
+            return httpx.Response(
+                200,
+                content=gzip.compress(UPSTREAM_HTML.encode()),
+                headers={"content-type": "text/html", "content-encoding": "gzip"},
+            )
         return httpx.Response(200, text=UPSTREAM_HTML, headers={"content-type": "text/html"})
 
     return httpx.Response(404, json={"error": "not found"})
@@ -130,7 +154,16 @@ def _handler(request: httpx.Request) -> httpx.Response:
 @pytest.fixture(autouse=True)
 def _reset_mocks():
     _requests_log.clear()
-    _routing_config.update(state="running", agent_ready=True, cluster_ip=CLUSTER_IP)
+    _routing_config.update(state="running", agent_ready=True, cluster_ip=CLUSTER_IP, agent_token="tok-alice")
+    _gzip_config["upstream_html"] = False
+    _redirect_config["location"] = None
+    _login_config["set_cookie"] = "session=abc; Path=/; HttpOnly"
+    _user_config["set_cookie"] = "workspace=ws-alice; Path=/; HttpOnly"
+    try:
+        import main as _gw
+        _gw._LAST_ACTIVITY_TOUCH.clear()
+    except ImportError:
+        pass  # main not imported yet — nothing to reset
     yield
     _requests_log.clear()
 

@@ -6,21 +6,38 @@ Gateway — session-aware reverse proxy for the agent workspace platform.
 """
 
 import os
-import asyncio
+import posixpath
 import time
+import asyncio
+import inspect
 from contextlib import asynccontextmanager
 
 import httpx
 import websockets
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from starlette.background import BackgroundTask
-from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, RedirectResponse
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound
+
+# websockets ≥14 renamed connect()'s handshake-header kwarg from
+# `extra_headers` to `additional_headers`; detect which this build accepts.
+_WS_HEADERS_KWARG = (
+    "additional_headers"
+    if "additional_headers" in inspect.signature(websockets.connect).parameters
+    else "extra_headers"
+)
 
 # ─── Configuration ───────────────────────────────────────────────────────
 
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://control-plane:80").rstrip("/")
 SERVICE_AUTH_TOKEN = os.environ.get("SERVICE_AUTH_TOKEN", "")
+PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "")
+
+# Throttled fire-and-forget liveness pings: at most one activity POST per
+# workspace per window, so the reconciler's idle check sees real usage.
+_ACTIVITY_THROTTLE_SECONDS = 60.0
+_ACTIVITY_PRUNE_SECONDS = 3600.0
+_LAST_ACTIVITY_TOUCH: dict[str, float] = {}
 
 # ─── Template engine ─────────────────────────────────────────────────────
 
@@ -79,6 +96,16 @@ async def get_routing_status(workspace_id: str, username: str | None = None) -> 
     return None
 
 
+def _agent_token(routing: dict) -> str:
+    """Return the workspace agent token for pod :9000 calls, or '' if absent.
+
+    Workspaces created before the agent_token column existed and never
+    reconciled have no token; callers must refuse the pod call rather than
+    send an unauthenticated request.
+    """
+    return routing.get("agent_token") or ""
+
+
 async def get_mcp_target(workspace_id: str, server_id: str, username: str) -> dict | None:
     """Resolve an MCP server's port from the control plane (authorized)."""
     try:
@@ -132,6 +159,43 @@ async def record_audit(event_type: str, metadata: dict | None = None) -> None:
         pass  # best-effort
 
 
+def _maybe_touch_activity(workspace_id: str) -> None:
+    """Schedule a throttled liveness ping for *workspace_id*.
+
+    At most one POST per workspace per window. The ping is fire-and-forget:
+    it never blocks or fails the caller, and it never logs the service token.
+    """
+    now = time.monotonic()
+    last = _LAST_ACTIVITY_TOUCH.get(workspace_id)
+    if last is not None and now - last < _ACTIVITY_THROTTLE_SECONDS:
+        return
+    _LAST_ACTIVITY_TOUCH[workspace_id] = now
+    if len(_LAST_ACTIVITY_TOUCH) > 4096:
+        # Opportunistic prune of entries that can no longer throttle anything.
+        stale = [
+            wid for wid, ts in _LAST_ACTIVITY_TOUCH.items()
+            if now - ts >= _ACTIVITY_PRUNE_SECONDS
+        ]
+        for wid in stale:
+            _LAST_ACTIVITY_TOUCH.pop(wid, None)
+    asyncio.ensure_future(_report_activity(workspace_id))
+
+
+async def _report_activity(workspace_id: str) -> None:
+    """POST a workspace liveness touch to the control plane (best-effort)."""
+    try:
+        await get_client().post(
+            f"{CONTROL_PLANE_URL}/api/internal/activity",
+            headers={
+                "X-Service-Auth": SERVICE_AUTH_TOKEN,
+                "Content-Type": "application/json",
+            },
+            json={"workspace_id": workspace_id},
+        )
+    except Exception:
+        pass  # best-effort — never block the request
+
+
 def render_template(name: str, **kwargs) -> str:
     """Render a Jinja2 template."""
     try:
@@ -155,21 +219,47 @@ def workspace_id_for(username: str) -> str:
 def _build_upstream_headers(request: Request) -> dict:
     """Build headers to forward to the upstream, removing hop-by-hop headers.
 
-    Adds X-Forwarded-* headers.
+    Adds X-Forwarded-* headers. Client-supplied service headers
+    (X-Service-Auth / X-Service-User) and X-Forwarded-Host are stripped —
+    the gateway is their only source. X-Forwarded-Host is taken from
+    PUBLIC_HOST (never the client's Host); X-Forwarded-For only from the
+    peer address.
     """
     hop_by_hop = frozenset({
         "connection", "proxy-connection", "keep-alive", "upgrade",
     })
+    stripped = frozenset({
+        "x-service-auth", "x-service-user", "x-forwarded-host",
+    })
     headers = {}
     for name, value in request.headers.items():
-        if name.lower() not in hop_by_hop:
+        if name.lower() not in hop_by_hop and name.lower() not in stripped:
             headers[name] = value
 
-    headers["X-Forwarded-Host"] = request.headers.get("host", "")
+    if PUBLIC_HOST:
+        headers["X-Forwarded-Host"] = PUBLIC_HOST
     headers["X-Forwarded-Proto"] = request.url.scheme
     if request.client:
         headers["X-Forwarded-For"] = request.client.host
     return headers
+
+
+def _safe_proxy_path(full_path: str, root: str) -> bool:
+    """Return True when *full_path* is safe to forward upstream.
+
+    Rejects ``..`` path segments, backslashes and percent-encoded
+    dot/backslash variants (the request decoder can leave these behind),
+    and any path whose normalized form escapes *root*.
+    """
+    if "\\" in full_path or "%2e" in full_path.lower() or "%5c" in full_path.lower():
+        return False
+    if ".." in full_path.split("/"):
+        return False
+    root = root.rstrip("/") or "/"
+    if root == "/":
+        return True
+    normalized = posixpath.normpath(full_path)
+    return normalized == root or normalized.startswith(root + "/")
 
 
 def _rewrite_location(location: str, prefix: str, target_base: str) -> str:
@@ -204,6 +294,7 @@ async def proxy_http(
     *,
     expose_prefix: str | None = None,
     rewrite_location_prefix: str | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> Response:
     """Stream an HTTP request upstream.
 
@@ -219,6 +310,9 @@ async def proxy_http(
     rewrite_location_prefix
         If set, rewrite ``Location`` response headers that point inside
         the upstream so they include this prefix.
+    extra_headers
+        Additional upstream headers (e.g. ``X-Pod-Token`` for the
+        workspace agent); these take precedence over forwarded headers.
     """
     path = request.url.path
     if strip_prefix and path.startswith(strip_prefix):
@@ -226,12 +320,21 @@ async def proxy_http(
     if path and not path.startswith("/"):
         path = "/" + path
 
+    # Traversal guard: the client-controlled path must stay inside its own
+    # top-level route — no dot-dot segments, backslashes or encoded variants.
+    raw_path = request.url.path
+    root = "/" + raw_path.lstrip("/").split("/", 1)[0] if raw_path.strip("/") else "/"
+    if not _safe_proxy_path(raw_path, root):
+        return JSONResponse(content={"error": "Invalid path"}, status_code=400)
+
     query = request.url.query
     url = f"{target_base.rstrip('/')}{path}"
     if query:
         url += f"?{query}"
 
     headers = _build_upstream_headers(request)
+    if extra_headers:
+        headers.update(extra_headers)
     body = await request.body()
 
     upstream_req = get_client().build_request(
@@ -251,6 +354,15 @@ async def proxy_http(
             "content-length", "content-encoding",
         }
     }
+    if rewrite_location_prefix and upstream_resp.headers.get("location"):
+        # Redirects pointing inside the upstream must carry the gateway
+        # prefix or the browser would leave the gateway on follow.
+        headers = {k: v for k, v in headers.items() if k.lower() != "location"}
+        headers["location"] = _rewrite_location(
+            upstream_resp.headers["location"],
+            rewrite_location_prefix,
+            target_base,
+        )
     return StreamingResponse(
         upstream_resp.aiter_bytes(),
         status_code=upstream_resp.status_code,
@@ -258,17 +370,26 @@ async def proxy_http(
         background=BackgroundTask(upstream_resp.aclose),
     )
     resp_headers = dict(upstream_resp.headers)
-async def _relay_ws(client_ws: WebSocket, upstream_uri: str, auth_token: str | None = None) -> None:
+async def _relay_ws(
+    client_ws: WebSocket,
+    upstream_uri: str,
+    auth_token: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> None:
     """Relay WebSocket frames bidirectionally.
 
     If *auth_token* is provided, it is sent as a ``Sec-WebSocket-Protocol``
     subprotocol (``paseo.bearer.<token>``) during the upstream WebSocket
-    handshake to authenticate with the Paseo daemon.
+    handshake to authenticate with the Paseo daemon. *extra_headers* are
+    sent as HTTP headers on the upstream handshake (e.g. ``X-Pod-Token``
+    when the upstream is the workspace agent).
     """
     try:
         kwargs = {}
         if auth_token:
             kwargs["subprotocols"] = [f"paseo.bearer.{auth_token}"]
+        if extra_headers:
+            kwargs[_WS_HEADERS_KWARG] = extra_headers
         async with websockets.connect(upstream_uri, **kwargs) as upstream_ws:
             async def client_to_upstream():
                 try:
@@ -310,6 +431,29 @@ async def _relay_ws(client_ws: WebSocket, upstream_uri: str, auth_token: str | N
         logger.exception("[ws.relay] Unexpected error")
 
 
+async def _fetch_paseo_password(cluster_ip: str, agent_token: str) -> str:
+    """Fetch the Paseo WebSocket password from the workspace agent (:9000).
+
+    The agent requires ``X-Pod-Token`` on every endpoint; callers must pass
+    the workspace's agent_token and refuse the pod call when it is empty —
+    an empty token here returns "" without making any request.
+    """
+    if not agent_token:
+        return ""
+    try:
+        async with httpx.AsyncClient() as hc:
+            pw_resp = await hc.get(
+                f"http://{cluster_ip}:9000/password",
+                headers={"X-Pod-Token": agent_token},
+                timeout=httpx.Timeout(3.0),
+            )
+            if pw_resp.status_code == 200:
+                return pw_resp.json().get("password", "")
+    except Exception:
+        pass
+    return ""
+
+
 async def resolve_workspace(
     username: str,
     session_cookie: str | None = None,
@@ -340,8 +484,11 @@ async def resolve_workspace(
     state = routing.get("state", "")
     agent_ready = routing.get("agent_ready", False)
 
-    # Running and agent ready → proxy directly
-    if state == "running" and agent_ready is True:
+    # Running / idle_pending and agent ready → proxy directly. The pod is
+    # still up for idle_pending, so it routes like running — only
+    # hibernated/requested/failed workspaces get the wake page.
+    if state in ("running", "idle_pending") and agent_ready is True:
+        _maybe_touch_activity(workspace_id)
         return routing, None
 
     # Hibernated / requested / failed → trigger a start, show starting page
@@ -455,6 +602,8 @@ async def path_proxy(request: Request, call_next):
             prefix = p
             break
     if upstream_port:
+        if not _safe_proxy_path(BASE, prefix):
+            return JSONResponse(content={"error": "Invalid path"}, status_code=400)
         session = await validate_session(get_session_cookie(request))
         if not session:
             return RedirectResponse(url="/ui/login")
@@ -499,10 +648,20 @@ async def path_proxy(request: Request, call_next):
                     html = html.replace("<head>", f"<head>{base_tag}", 1)
                 elif "</head>" in html:
                     html = html.replace("</head>", f"{base_tag}</head>", 1)
-                new_h = dict(resp.headers)
-                new_h.pop("content-length", None)
+                # The body is re-encoded from resp.text, so drop the
+                # upstream content-encoding/content-length (and other
+                # hop-by-hop) headers — keeping them yields blank pages
+                # for gzipped upstream HTML.
+                new_h = {k:v for k,v in resp.headers.items() if k.lower() not in {"content-length","content-encoding","transfer-encoding","date","server"}}
                 return Response(content=html, status_code=200, headers=new_h)
             new_h = {k:v for k,v in resp.headers.items() if k.lower() not in {"content-length","content-encoding","transfer-encoding","date","server"}}
+            if resp.headers.get("location"):
+                new_h = {k: v for k, v in new_h.items() if k.lower() != "location"}
+                new_h["location"] = _rewrite_location(
+                    resp.headers["location"],
+                    prefix,
+                    f"http://{cluster_ip}:{upstream_port}",
+                )
             return Response(content=resp.content, status_code=resp.status_code, headers=new_h)
     return await call_next(request)
 
@@ -538,10 +697,13 @@ async def login_proxy(request: Request):
         method = request.method.lower()
         resp = await c.request(method, url, headers=headers, content=body)
         resp_headers = dict(resp.headers)
-        # Add cookie domain so chat.* and code.* subdomains can read it
+        # Add cookie domain so chat.* and code.* subdomains can read it —
+        # only when COOKIE_DOMAIN is configured; unset/empty forwards
+        # Set-Cookie verbatim (never a foreign placeholder domain).
         set_cookie = resp_headers.get("set-cookie", "")
-        if set_cookie and "domain=" not in set_cookie.lower():
-            resp_headers["set-cookie"] = set_cookie + "; Domain=" + os.environ.get("COOKIE_DOMAIN", ".example.com")
+        cookie_domain = os.environ.get("COOKIE_DOMAIN", "")
+        if set_cookie and "domain=" not in set_cookie.lower() and cookie_domain:
+            resp_headers["set-cookie"] = set_cookie + "; Domain=" + cookie_domain
         return Response(content=resp.content, status_code=resp.status_code, headers={k:v for k,v in resp_headers.items() if k.lower() not in ["content-length","content-encoding","transfer-encoding","date","server"]})
 
 
@@ -583,6 +745,8 @@ async def groups_page():
 @app.api_route("/ui/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def ui_proxy(request: Request, path: str):
     """Proxy UI routes (except /ui/login) to the control plane."""
+    if not _safe_proxy_path(request.url.path, "/ui"):
+        return JSONResponse(content={"error": "Invalid path"}, status_code=400)
     return await proxy_http(request, CONTROL_PLANE_URL, strip_prefix="/ui")
 
 
@@ -606,14 +770,21 @@ async def workspace_status(request: Request):
 @app.get("/workspace/status/{path:path}")
 async def workspace_status_path(request: Request, path: str):
     """Same as above — catches sub-paths."""
+    # Reject dot-dot / encoded variants before any auth work — the raw-path
+    # check does not depend on the session.
+    if not _safe_proxy_path(request.url.path, "/workspace/status"):
+        return JSONResponse(content={"error": "Invalid path"}, status_code=400)
     session, err_resp = await _authenticate_workspace_request(request)
     if err_resp:
         return err_resp
 
     workspace_id = workspace_id_for(session["username"])
+    upstream_root = f"/api/workspaces/{workspace_id}/status"
+    if not _safe_proxy_path(f"{upstream_root}/{path}", upstream_root):
+        return JSONResponse(content={"error": "Invalid path"}, status_code=400)
     return await proxy_http(
         request,
-        f"{CONTROL_PLANE_URL}/api/workspaces/{workspace_id}/status/{path}",
+        f"{CONTROL_PLANE_URL}{upstream_root}",
         strip_prefix="/workspace/status",
     )
 
@@ -647,6 +818,8 @@ async def paseo_sw(request: Request):
 
 async def resolve_and_proxy(request: Request, target_path: str) -> Response:
     """Resolve workspace and proxy request to Paseo."""
+    if not _safe_proxy_path(target_path, "/workspace/chat"):
+        return JSONResponse(content={"error": "Invalid path"}, status_code=400)
     session = await validate_session(get_session_cookie(request))
     if not session:
         return RedirectResponse(url="/ui/login")
@@ -661,6 +834,10 @@ async def resolve_and_proxy(request: Request, target_path: str) -> Response:
 
 async def api_proxy(request: Request, path: str):
     """Proxy API routes to the control plane."""
+    # Traversal validation MUST run before the health/oidc whitelist check —
+    # otherwise `..` segments can smuggle authenticated routes past it.
+    if not _safe_proxy_path(request.url.path, "/api"):
+        return JSONResponse(content={"error": "Invalid path"}, status_code=400)
     session = await validate_session(get_session_cookie(request))
     if not session and not (path.startswith("health") or path.startswith("oidc")):
         return RedirectResponse(url="/ui/login")
@@ -678,15 +855,18 @@ async def api_proxy(request: Request, path: str):
         method = request.method.lower()
         resp = await c.request(method, url, headers=headers, content=body)
         resp_headers = dict(resp.headers)
-        # Add cookie domain so chat.* and code.* subdomains can read it
+        # Add cookie domain so chat.* and code.* subdomains can read it —
+        # only when COOKIE_DOMAIN is configured; unset/empty forwards
+        # Set-Cookie verbatim (never a foreign placeholder domain).
         set_cookie = resp_headers.get("set-cookie", "")
-        if set_cookie and "domain=" not in set_cookie.lower():
-            resp_headers["set-cookie"] = set_cookie + "; Domain=" + os.environ.get("COOKIE_DOMAIN", ".example.com")
+        cookie_domain = os.environ.get("COOKIE_DOMAIN", "")
+        if set_cookie and "domain=" not in set_cookie.lower() and cookie_domain:
+            resp_headers["set-cookie"] = set_cookie + "; Domain=" + cookie_domain
         return Response(content=resp.content, status_code=resp.status_code, headers={k:v for k,v in resp_headers.items() if k.lower() not in ["content-length","content-encoding","transfer-encoding","date","server"]})
 
 
 async def _proxy_paseo(request: Request, cluster_ip: str) -> Response:
-    """Proxy to Paseo, inject base tag + routing fix for Expo Router."""
+    """Proxy to Paseo, rewriting Location headers for the gateway prefix."""
     async with httpx.AsyncClient() as client:
         path = request.url.path
         if path.startswith("/workspace/chat"):
@@ -702,31 +882,23 @@ async def _proxy_paseo(request: Request, cluster_ip: str) -> Response:
         resp = await client.request(request.method, url, headers=headers, content=body)
         ct = resp.headers.get("content-type", "")
         if "text/html" in ct and resp.status_code == 200:
-            # Forward Paseo HTML as-is - bundled UI auto-connects to same origin
-            return Response(content=resp.text, status_code=200, headers=dict(resp.headers))
-            html = resp.text
-            # inject <base> tag + JS routing fix before </head>
-            fix = (
-                '<base href="/workspace/chat/" />'
-                '<script>'
-                '(function(){'
-                "var b='/workspace/chat';"
-                "if(location.pathname===b||location.pathname===b+'/'){"
-                "history.replaceState(null,'','/');"
-                "}"
-                "var p=history.pushState.bind(history);"
-                "history.pushState=function(s,t,u){"
-                "if(typeof u==='string'&&u.startsWith('/')&&!u.startsWith(b)){u=b+u;}"
-                "return p(s,t,u);"
-                "};"
-                "})();"
-                '</script>'
+            # Forward Paseo HTML as-is - bundled UI auto-connects to same origin.
+            # The body is re-encoded from resp.text, so drop the upstream
+            # content-encoding/content-length (and other hop-by-hop) headers —
+            # keeping them yields blank pages for gzipped upstream HTML.
+            new_headers = {k: v for k, v in resp.headers.items() if k.lower() not in {"content-length", "content-encoding", "transfer-encoding", "date", "server"}}
+            return Response(content=resp.text, status_code=200, headers=new_headers)
+        new_headers = {k: v for k, v in resp.headers.items() if k.lower() not in {"content-length", "content-encoding", "transfer-encoding", "date", "server"}}
+        if resp.headers.get("location"):
+            # Redirects pointing inside the upstream must carry the gateway
+            # prefix or the browser would leave the gateway on follow.
+            new_headers = {k: v for k, v in new_headers.items() if k.lower() != "location"}
+            new_headers["location"] = _rewrite_location(
+                resp.headers["location"],
+                "/workspace/chat",
+                f"http://{cluster_ip}:6767",
             )
-            html = html.replace("</head>", fix + "</head>")
-            new_headers = dict(resp.headers)
-            new_headers.pop("content-length", None)
-            return Response(content=html, status_code=200, headers=new_headers)
-        return Response(content=resp.content, status_code=resp.status_code, headers={k:v for k,v in resp.headers.items() if k.lower() not in ["content-length","content-encoding","transfer-encoding","date","server"]})
+        return Response(content=resp.content, status_code=resp.status_code, headers=new_headers)
 @app.api_route("/workspace/chat/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def workspace_chat(request: Request, path: str):
     """Proxy HTTP requests to Paseo in the user workspace."""
@@ -759,8 +931,13 @@ async def workspace_chat_root(request: Request):
 @app.websocket("/workspace/chat/ws/{path:path}")
 async def workspace_chat_ws(websocket: WebSocket, path: str):
     """Proxy WebSocket connections to Paseo."""
-    await websocket.accept()
+    # Traversal guard on the upstream socket path.
+    if not _safe_proxy_path(f"/ws/{path}", "/ws"):
+        await websocket.close(1008)
+        return
 
+    # Auth-before-accept: unauthenticated clients are rejected without
+    # completing the 101 upgrade.
     cookie = websocket.cookies.get("session")
     if not cookie:
         await websocket.close(1008)
@@ -781,17 +958,18 @@ async def workspace_chat_ws(websocket: WebSocket, path: str):
         await websocket.close(1011)
         return
 
+    agent_token = _agent_token(routing)
+    if not agent_token:
+        logger.warning("[ws.chat] refusing pod call: workspace has no agent token")
+        await websocket.close(1011)
+        return
+
+    await websocket.accept()
+
     asyncio.ensure_future(record_audit("gateway.route_granted", {"route_class": "chat", "protocol": "ws"}))
 
-    # Fetch Paseo password for WebSocket auth
-    paseo_ws_token = ""
-    try:
-        async with httpx.AsyncClient() as hc:
-            pw_resp = await hc.get(f"http://{cluster_ip}:9000/password", timeout=httpx.Timeout(3.0))
-            if pw_resp.status_code == 200:
-                paseo_ws_token = pw_resp.json().get("password", "")
-    except Exception:
-        pass
+    # Fetch Paseo password for WebSocket auth (agent requires X-Pod-Token)
+    paseo_ws_token = await _fetch_paseo_password(cluster_ip, agent_token)
     upstream_uri = f"ws://{cluster_ip}:6767/ws/{path}"
     await _relay_ws(websocket, upstream_uri, auth_token=paseo_ws_token or None)
 
@@ -835,8 +1013,13 @@ async def workspace_code_root(request: Request):
 @app.websocket("/workspace/code/{path:path}")
 async def _code_ws_relay(websocket: WebSocket, path: str):
     """Proxy WebSocket connections to code-server."""
-    await websocket.accept()
+    # Traversal guard on the upstream socket path.
+    if not _safe_proxy_path(f"/{path}", "/"):
+        await websocket.close(1008)
+        return
 
+    # Auth-before-accept: unauthenticated clients are rejected without
+    # completing the 101 upgrade.
     cookie = websocket.cookies.get("session")
     if not cookie:
         await websocket.close(1008)
@@ -856,6 +1039,8 @@ async def _code_ws_relay(websocket: WebSocket, path: str):
     if not cluster_ip:
         await websocket.close(1011)
         return
+
+    await websocket.accept()
 
     asyncio.ensure_future(record_audit("gateway.route_granted", {"route_class": "code", "protocol": "ws"}))
 
@@ -881,6 +1066,8 @@ async def workspace_dev(request: Request, port: int, path: str):
     The port must be registered via the workspace agent's exposure API.
     Only allowlisted ports are accepted.
     """
+    if not _safe_proxy_path(request.url.path, f"/workspace/dev/{port}"):
+        return JSONResponse(content={"error": "Invalid path"}, status_code=400)
     session, err_resp = await _authenticate_workspace_request(request)
     if err_resp:
         return err_resp
@@ -896,6 +1083,13 @@ async def workspace_dev(request: Request, port: int, path: str):
             status_code=503,
         )
 
+    agent_token = _agent_token(routing)
+    if not agent_token:
+        return HTMLResponse(
+            content=render_template("error.html", message="Workspace agent is not authenticated."),
+            status_code=503,
+        )
+
     # Find the registered exposure for this port
     exposures = routing.get("exposures", [])
     matched = [e for e in exposures if e.get("port") == port]
@@ -907,6 +1101,10 @@ async def workspace_dev(request: Request, port: int, path: str):
 
     exposure = matched[0]
     exposure_id = exposure.get("id", port)
+    upstream_root = f"/agent/exposures/{exposure_id}/proxy"
+    remainder = request.url.path[len(f"/workspace/dev/{port}"):]
+    if not _safe_proxy_path(f"{upstream_root}{remainder}", upstream_root):
+        return JSONResponse(content={"error": "Invalid path"}, status_code=400)
     asyncio.ensure_future(record_audit("gateway.route_granted", {
         "route_class": "dev",
         "port": port,
@@ -917,14 +1115,15 @@ async def workspace_dev(request: Request, port: int, path: str):
         request,
         f"http://{cluster_ip}:9000/agent/exposures/{exposure_id}/proxy",
         strip_prefix=f"/workspace/dev/{port}",
+        extra_headers={"X-Pod-Token": agent_token},
     )
 
 
 @app.websocket("/workspace/dev/{port:int}/ws/{path:path}")
 async def workspace_dev_ws(websocket: WebSocket, port: int, path: str):
     """Proxy WebSocket connections to a registered dev server."""
-    await websocket.accept()
-
+    # Auth-before-accept: unauthenticated clients are rejected without
+    # completing the 101 upgrade.
     cookie = websocket.cookies.get("session")
     if not cookie:
         await websocket.close(1008)
@@ -945,6 +1144,12 @@ async def workspace_dev_ws(websocket: WebSocket, port: int, path: str):
         await websocket.close(1011)
         return
 
+    agent_token = _agent_token(routing)
+    if not agent_token:
+        logger.warning("[ws.dev] refusing pod call: workspace has no agent token")
+        await websocket.close(1011)
+        return
+
     exposures = routing.get("exposures", [])
     matched = [e for e in exposures if e.get("port") == port]
     if not matched:
@@ -952,6 +1157,13 @@ async def workspace_dev_ws(websocket: WebSocket, port: int, path: str):
         return
 
     exposure_id = matched[0].get("id", port)
+    upstream_root = f"/agent/exposures/{exposure_id}/proxy/ws"
+    if not _safe_proxy_path(f"{upstream_root}/{path}", upstream_root):
+        await websocket.close(1008)
+        return
+
+    await websocket.accept()
+
     asyncio.ensure_future(record_audit("gateway.route_granted", {
         "route_class": "dev",
         "port": port,
@@ -959,7 +1171,7 @@ async def workspace_dev_ws(websocket: WebSocket, port: int, path: str):
     }))
 
     upstream_uri = f"ws://{cluster_ip}:9000/agent/exposures/{exposure_id}/proxy/ws/{path}"
-    await _relay_ws(websocket, upstream_uri)
+    await _relay_ws(websocket, upstream_uri, extra_headers={"X-Pod-Token": agent_token})
 
 
 @app.get("/workspace/starting")
@@ -975,44 +1187,58 @@ async def workspace_starting():
 @app.websocket("/canvas/sockets")
 @app.websocket("/chat/ws")
 async def path_ws_root(websocket: WebSocket):
-    """Handle WebSocket for workspace services."""
+    """Handle WebSocket for workspace services.
+
+    /canvas/sockets and /chat/ws are relayed to the session user's
+    workspace pod; any other socket path is rejected.
+    """
     path = websocket.url.path
-    if path == "/canvas/sockets":
-        await relay_ws(websocket, 8000)
-    elif path == "/chat/ws":
-        await relay_ws(websocket, 6767)
-    else:
+    if path not in ("/canvas/sockets", "/chat/ws"):
         await websocket.close(1011)
-    async def client_to_upstream():
-        try:
-            while True:
-                msg = await websocket.receive()
-                if msg["type"] == "websocket.receive":
-                    if msg.get("text"):
-                        logger.warning("[ws.seq] t=%06d browser->upstream text len=%d", int((time.monotonic()-_t0)*1e6), len(msg["text"]))
-                        await upstream_ws.send(msg["text"])
-                    elif msg.get("bytes"):
-                        await upstream_ws.send(msg["bytes"])
-                elif msg["type"] == "websocket.disconnect":
-                    break
-        except WebSocketDisconnect:
-            pass
+        return
 
-    async def upstream_to_client():
-        try:
-            async for msg in upstream_ws:
-                now = time.monotonic() - _t0
-                mtype = "text" if isinstance(msg, str) else "binary"
-                if isinstance(msg, str):
-                    logger.warning("[ws.seq] t=%06d upstream->browser text len=%d first200=%s", int(now*1e6), len(msg), msg[:200])
-                    await websocket.send_text(msg)
-                elif isinstance(msg, bytes):
-                    await websocket.send_bytes(msg)
-        except websockets.ConnectionClosed:
-            pass
+    # Auth-before-accept: unauthenticated clients are rejected without
+    # completing the 101 upgrade.
+    cookie = websocket.cookies.get("session")
+    if not cookie:
+        await websocket.close(1008)
+        return
 
-    await asyncio.gather(client_to_upstream(), upstream_to_client())
-    logger.warning("[ws.seq] t=%06d relay done", int((time.monotonic()-_t0)*1e6))
+    session = await validate_session(cookie)
+    if session is None:
+        await websocket.close(1008)
+        return
+
+    routing, ws_resp = await resolve_workspace(session["username"], websocket.cookies.get("session"))
+    if ws_resp or not routing:
+        await websocket.close(1011)
+        return
+
+    cluster_ip = routing.get("cluster_ip")
+    if not cluster_ip:
+        await websocket.close(1011)
+        return
+
+    agent_token = _agent_token(routing)
+    if not agent_token:
+        logger.warning("[ws.root] refusing pod call: workspace has no agent token")
+        await websocket.close(1011)
+        return
+
+    await websocket.accept()
+
+    asyncio.ensure_future(record_audit("gateway.route_granted", {
+        "route_class": "canvas" if path == "/canvas/sockets" else "chat",
+        "protocol": "ws",
+    }))
+
+    if path == "/canvas/sockets":
+        await _relay_ws(websocket, f"ws://{cluster_ip}:8000/sockets")
+        return
+
+    # /chat/ws — fetch the Paseo WS token like workspace_chat_ws.
+    paseo_ws_token = await _fetch_paseo_password(cluster_ip, agent_token)
+    await _relay_ws(websocket, f"ws://{cluster_ip}:6767/ws", auth_token=paseo_ws_token or None)
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def catch_all(path: str):
     """Serve 404 page for any unmatched route."""
