@@ -89,6 +89,7 @@ async def app(db_ready):
     # so API tests are deterministic and offline.
     reconciler._get_cluster_ip = AsyncMock(return_value=None)
     reconciler._check_pod_ready = AsyncMock(return_value=False)
+    reconciler._check_pod_ready_host = AsyncMock(return_value=False)
     return real_app
 
 

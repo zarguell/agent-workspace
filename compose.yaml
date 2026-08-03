@@ -1,0 +1,72 @@
+name: agent-platform-local
+
+# Local development stack: Postgres + control plane + gateway.
+# No Kubernetes required. Workspace *pods* remain a K8s concept — to run the
+# full Canvas/code-server flow locally, point WORKSPACE_DEV_HOST at any
+# container exposing the workspace ports (6767/8080/8000/9000); the control
+# plane then routes to it instead of a ClusterIP.
+#
+#   docker compose up --build
+#   open http://localhost:${GATEWAY_PORT:-18088}/ui/login
+#
+# Env overrides: SERVICE_AUTH_TOKEN, SEED_ADMIN_USER, SEED_ADMIN_PASSWORD,
+# WORKSPACE_DEV_HOST, CONTROL_PLANE_PORT, GATEWAY_PORT, POSTGRES_PORT.
+# (Set them in a .env file next to this file.)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+      POSTGRES_DB: agentplatform
+    ports:
+      - "${POSTGRES_PORT:-15432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agentplatform"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  control-plane:
+    build: ./services/control-plane
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agent:agent@postgres:5432/agentplatform
+      SERVICE_AUTH_TOKEN: ${SERVICE_AUTH_TOKEN:-local-token}
+      SEED_ADMIN_USER: ${SEED_ADMIN_USER:-admin}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-admin}
+      DISABLE_RECONCILER: "1"
+      WORKSPACE_DEV_HOST: ${WORKSPACE_DEV_HOST:-}
+    ports:
+      - "${CONTROL_PLANE_PORT:-18011}:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:80/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  gateway:
+    build: ./services/gateway
+    environment:
+      CONTROL_PLANE_URL: http://control-plane:80
+      SERVICE_AUTH_TOKEN: ${SERVICE_AUTH_TOKEN:-local-token}
+      # Empty domain → host-only session cookie, so localhost / agents.local.test work.
+      COOKIE_DOMAIN: ""
+    ports:
+      - "${GATEWAY_PORT:-18088}:80"
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:80/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:

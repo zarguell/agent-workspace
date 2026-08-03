@@ -70,6 +70,46 @@ curl -H "Host: example.com" http://<node-ip>:<nodeport>/api/health
 
 Open `http://example.com:<nodeport>/` in a browser. Login with the default admin credentials (set via `SEED_ADMIN_USER` / `SEED_ADMIN_PASSWORD` env vars, defaults: `admin`/`admin`).
 
+## Local Development (Docker Compose)
+
+The `compose.yaml` at the repo root runs the full control plane + gateway +
+Postgres stack locally without Kubernetes. Useful while a cluster is
+unavailable, or for UI/API development.
+
+```bash
+docker compose up --build
+```
+
+Then open `http://localhost:18088/ui/login` (admin credentials:
+`SEED_ADMIN_USER` / `SEED_ADMIN_PASSWORD`, defaults `admin`/`admin`).
+The gateway is at port `18088`, the control plane at `18011`, Postgres at
+`15432` — override with `CONTROL_PLANE_PORT`, `GATEWAY_PORT`,
+`POSTGRES_PORT` in a `.env` file next to `compose.yaml`.
+
+Key env vars:
+
+| Variable | Default | Description |
+|---|---|---|
+| `SERVICE_AUTH_TOKEN` | `local-token` | Shared token; must match between gateway and control plane |
+| `DISABLE_RECONCILER` | `1` | Skip the K8s reconciler (no cluster in Compose) |
+| `WORKSPACE_DEV_HOST` | — | Fixed workspace host to route to instead of a K8s ClusterIP |
+| `SEED_ADMIN_USER` / `SEED_ADMIN_PASSWORD` | `admin` / `admin` | First-run admin seed |
+
+Workspace *pods* remain a Kubernetes concept. To exercise the full
+Canvas / code-server flow locally, run a workspace container that exposes
+ports `6767` (Paseo), `8080` (code-server), `8000` (Canvas), `9000` (agent),
+then set `WORKSPACE_DEV_HOST` to its address (a compose service name or
+`host.docker.internal`) and restart:
+
+```bash
+WORKSPACE_DEV_HOST=workspace-dev docker compose up -d
+```
+
+The control plane then reports that host as the workspace ClusterIP and
+probes its `:9000/ready` endpoint for readiness, so the gateway proxies to
+it exactly as it would to a pod.
+
+
 ## Configuration
 
 ### Environment Variables

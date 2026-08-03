@@ -359,11 +359,9 @@ class Reconciler:
 
     # ─── Pod readiness check ───────────────────────────────────────────
 
-    async def _check_pod_ready(self, user_id: str) -> bool:
-        """Check if the workspace pod is ready by polling /ready."""
-        ns = _ns_name(user_id)
-        svc_name = _svc_name(user_id)
-        url = f"http://{svc_name}.{ns}.svc.cluster.local:9000/ready"
+    async def _check_pod_ready_host(self, host: str) -> bool:
+        """Probe a workspace agent's /ready endpoint on *host*."""
+        url = f"http://{host}:9000/ready"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(url, headers={"X-Service-Auth": SERVICE_AUTH_TOKEN})
@@ -373,6 +371,12 @@ class Reconciler:
                 return False
         except Exception:
             return False
+
+    async def _check_pod_ready(self, user_id: str) -> bool:
+        """Check if the workspace pod is ready by polling /ready."""
+        ns = _ns_name(user_id)
+        svc_name = _svc_name(user_id)
+        return await self._check_pod_ready_host(f"{svc_name}.{ns}.svc.cluster.local")
 
     async def _get_cluster_ip(self, user_id: str) -> Optional[str]:
         """Get ClusterIP of the workspace service.

@@ -139,3 +139,23 @@ async def test_audit_with_service_auth(client, service_token):
     )
     assert resp.status_code == 201
     assert resp.json()["ok"] is True
+
+
+async def test_routing_dev_host_mode(client, service_token, monkeypatch):
+    """WORKSPACE_DEV_HOST bypasses K8s: routing returns the fixed host."""
+    from unittest.mock import AsyncMock
+    from reconciler import reconciler
+
+    monkeypatch.setenv("WORKSPACE_DEV_HOST", "10.9.9.9")
+    reconciler._check_pod_ready_host = AsyncMock(return_value=True)
+    await seed_user("alice")
+    await _login(client, "alice")
+
+    resp = await client.get(
+        "/api/internal/workspaces/ws-alice/routing",
+        headers={"X-Service-Auth": service_token, "X-Service-User": "alice"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cluster_ip"] == "10.9.9.9"
+    assert body["agent_ready"] is True

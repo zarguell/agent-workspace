@@ -89,18 +89,22 @@ async def lifespan(app: FastAPI):
             await db.commit()
             logger.info("Seeded admin user")
 
-    # Start background reconciler
-    task = asyncio.create_task(reconciler.run())
-    app.state.reconciler_task = task
+    # Start background reconciler (skip when DISABLE_RECONCILER=1, e.g. the
+    # Docker Compose local stack where there is no cluster to reconcile).
+    reconciler_enabled = os.environ.get("DISABLE_RECONCILER", "").lower() not in ("1", "true", "yes")
+    if reconciler_enabled:
+        task = asyncio.create_task(reconciler.run())
+        app.state.reconciler_task = task
 
     yield
 
     # Shutdown
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    if reconciler_enabled:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     logger.info("Control-plane service stopped")
 
 
@@ -649,8 +653,15 @@ async def get_workspace_routing(request: Request, workspace_id: str):
         if not allowed:
             return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
 
-        cluster_ip = await reconciler._get_cluster_ip(ws.user_id)
-        agent_ready = await reconciler._check_pod_ready(ws.user_id)
+        # Dev mode (Docker Compose local stack): route to a fixed workspace
+        # container instead of a K8s ClusterIP.
+        dev_host = os.environ.get("WORKSPACE_DEV_HOST", "")
+        if dev_host:
+            cluster_ip = dev_host
+            agent_ready = await reconciler._check_pod_ready_host(dev_host)
+        else:
+            cluster_ip = await reconciler._get_cluster_ip(ws.user_id)
+            agent_ready = await reconciler._check_pod_ready(ws.user_id)
 
         return WorkspaceRoutingStatus(
             workspace_id=workspace_id,
@@ -659,6 +670,7 @@ async def get_workspace_routing(request: Request, workspace_id: str):
             agent_ready=agent_ready,
             exposures=[],
         ).model_dump()
+
 
 
 # ─── Admin endpoints ──────────────────────────────────────────────────
