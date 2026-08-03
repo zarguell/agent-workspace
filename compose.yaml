@@ -17,7 +17,7 @@ name: agent-platform-local
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: agent
       POSTGRES_PASSWORD: agent
