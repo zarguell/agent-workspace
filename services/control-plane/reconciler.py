@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from audit import record_audit_event
 from database import async_session_factory
-from models import Workspace, WorkspaceSecret
+from models import User, Workspace, WorkspaceSecret
 from secrets_store import decrypt_value
 
 logger = logging.getLogger("control-plane.reconciler")
@@ -440,9 +440,15 @@ class Reconciler:
                         )
                         await db.commit()
                     logger.info("Persisted Canvas keys for workspace %s", ws.workspace_id)
-                # Workspace secrets → WS_SECRET_<KEY> env vars
+                # Workspace identity + secrets → env vars (the agent uses
+                # these to report usage and to source WS_SECRET_* values).
                 secret_env: list = []
+                username = ""
                 async with async_session_factory() as db:
+                    user_result = await db.execute(select(User).where(User.user_id == ws.user_id))
+                    user = user_result.scalar_one_or_none()
+                    if user:
+                        username = user.username
                     result = await db.execute(
                         select(WorkspaceSecret).where(WorkspaceSecret.workspace_id == ws.workspace_id)
                     )
@@ -451,13 +457,17 @@ class Reconciler:
                             name=f"WS_SECRET_{s.key.upper()}",
                             value=decrypt_value(s.value_encrypted),
                         ))
+                extra_env = [
+                    client.V1EnvVar(name="WORKSPACE_ID", value=ws.workspace_id),
+                    client.V1EnvVar(name="USERNAME", value=username),
+                ] + secret_env
                 self._ensure_deployment(
                     user_id,
                     ws.image or WORKSPACE_IMAGE,
                     replicas=1,
                     canvas_api_key=canvas_api_key,
                     canvas_secret_key=canvas_secret_key,
-                    extra_env=secret_env,
+                    extra_env=extra_env,
                 )
             except Exception as e:
                 logger.error("Failed to create K8s resources for workspace %s: %s", ws.workspace_id, e)

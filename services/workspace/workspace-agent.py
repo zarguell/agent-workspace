@@ -1,14 +1,20 @@
 #!/usr/bin/python3
-"""Workspace agent: readiness, activity, dev-server registration."""
-import json, os, socket, subprocess, sys, time, threading
+"""Workspace agent: readiness, activity, dev-server registration, usage reporting."""
+import json, os, socket, subprocess, sys, time, threading, urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 WORKSPACE = os.environ.get("WORKSPACE", "/workspace")
 PORT = int(os.environ.get("AGENT_PORT", "9000"))
+CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://control-plane:80").rstrip("/")
+SERVICE_AUTH_TOKEN = os.environ.get("SERVICE_AUTH_TOKEN", "")
+USERNAME = os.environ.get("USERNAME", "")
+WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
+REPORT_INTERVAL = int(os.environ.get("REPORT_INTERVAL", "300"))
 
 # Dev server registry
 registered_ports = {}
 ALLOWED_PORTS = {6767, 3000, 4173, 5000, 5173, 8000, 8081}
+
 
 class AgentHandler(BaseHTTPRequestHandler):
     def _respond(self, code, body):
@@ -85,12 +91,67 @@ class AgentHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # quiet
 
+
+def report_usage_loop():
+    """Periodically report compute/storage usage to the control plane.
+
+    Best-effort: transient failures (control plane down, quota 429) are
+    swallowed and retried on the next interval. Token usage is NOT
+    observable here — that requires agent-server/Canvas integration and is
+    a separate emitter.
+    """
+    while True:
+        try:
+            events = [
+                {
+                    "category": "compute",
+                    "metric": "agent_uptime_seconds",
+                    "amount": int(time.time() - start_time),
+                    "unit": "s",
+                    "workspace_id": WORKSPACE_ID,
+                },
+            ]
+            try:
+                du = subprocess.run(["du", "-sk", WORKSPACE], capture_output=True, text=True, timeout=15)
+                if du.returncode == 0:
+                    events.append({
+                        "category": "storage",
+                        "metric": "workspace_kb",
+                        "amount": int(du.stdout.split()[0]),
+                        "unit": "kB",
+                        "workspace_id": WORKSPACE_ID,
+                    })
+            except Exception:
+                pass
+
+            if not SERVICE_AUTH_TOKEN or not USERNAME:
+                time.sleep(REPORT_INTERVAL)
+                continue
+
+            req = urllib.request.Request(
+                f"{CONTROL_PLANE_URL}/api/internal/usage",
+                data=json.dumps({"events": events}).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Service-Auth": SERVICE_AUTH_TOKEN,
+                    "X-Service-User": USERNAME,
+                },
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=10).read()
+        except Exception:
+            pass  # retry next interval
+        time.sleep(REPORT_INTERVAL)
+
+
 def main():
     global start_time
     start_time = time.time()
+    threading.Thread(target=report_usage_loop, daemon=True).start()
     server = HTTPServer(("0.0.0.0", PORT), AgentHandler)
     print(f"workspace-agent listening on :{PORT}", flush=True)
     server.serve_forever()
+
 
 if __name__ == "__main__":
     main()

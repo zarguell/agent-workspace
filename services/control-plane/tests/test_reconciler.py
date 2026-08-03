@@ -279,3 +279,5 @@ async def test_secrets_injected_as_env(db, monkeypatch):
 
     env = _deploy_env(apps)
     assert env["WS_SECRET_MY_TOKEN"] == "super-secret"
+    assert env["WORKSPACE_ID"] == "ws-sec-user"
+    assert env["USERNAME"] == "sec-user"

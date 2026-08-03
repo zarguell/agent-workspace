@@ -18,7 +18,12 @@ fi
 PASEO_HOME="${PASEO_HOME:-$HOME/.paseo}"
 mkdir -p "$PASEO_HOME"
 if [ ! -f "$PASEO_HOME/config.json" ]; then
-    cat > "$PASEO_HOME/config.json" << "CONFEOF"
+    # NOTE: values below are expanded by the shell (unquoted delimiter).
+    # The hostnames/CORS block is from the subdomain era of the platform;
+    # under path-based routing (/chat/ -> :6767 via the gateway) these are
+    # informational only and should be reviewed against Paseo's behavior
+    # on the live cluster.
+    cat > "$PASEO_HOME/config.json" << CONFEOF
 {
   "version": 1,
   "daemon": {

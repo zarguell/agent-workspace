@@ -155,7 +155,6 @@ values requires operate permission, listing names requires view.
 
 
 
-
 ## Configuration
 
 ### Environment Variables
@@ -171,6 +170,8 @@ values requires operate permission, listing names requires view.
 | `WORKSPACE_IMAGE` | `localhost:5000/agent-workspace:dev-latest` | Container image for workspace pods |
 | `OH_AGENT_SERVER_VERSION` | `1.37.0` | Pinned agent-server version (must match image pre-warm) |
 | `UV_CACHE_DIR` | `/opt/uv-cache` | uv cache path (baked into image at build; reused at runtime) |
+| `CONTROL_PLANE_URL` | `http://control-plane:80` | Where the workspace agent reports usage (injected into pods) |
+| `REPORT_INTERVAL` | `300` | Seconds between workspace-agent usage reports (compute + storage) |
 
 ### Workspace persistence
 
