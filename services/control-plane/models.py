@@ -11,6 +11,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -176,3 +177,38 @@ class WorkspaceShare(Base):
         nullable=False,
     )
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+class Quota(Base):
+    """Per-user resource and budget limits. NULL means unlimited."""
+
+    __tablename__ = "quotas"
+
+    user_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    max_monthly_tokens = Column(BigInteger, nullable=True)
+    max_storage_gb = Column(Integer, nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+
+
+class UsageEvent(Base):
+    """Append-only usage ledger row, reported by workspace agents."""
+
+    __tablename__ = "usage_events"
+    __table_args__ = (
+        Index("ix_usage_user_period", "user_id", "period_start"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(UUID(as_uuid=False), nullable=False, index=True)
+    workspace_id = Column(String(255), nullable=False, index=True)
+    category = Column(String(20), nullable=False, index=True)  # tokens | compute | storage
+    metric = Column(String(100), nullable=False)
+    amount = Column(BigInteger, nullable=False)
+    unit = Column(String(20), nullable=False)
+    # First day of the UTC month the usage belongs to (billing period).
+    period_start = Column(DateTime(timezone=True), nullable=False, index=True)
+    recorded_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)

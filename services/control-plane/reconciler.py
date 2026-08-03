@@ -234,6 +234,7 @@ class Reconciler:
                         # Pin Canvas credentials so reconnect survives pod recreate
                         client.V1EnvVar(name="LOCAL_BACKEND_API_KEY", value=canvas_api_key),
                         client.V1EnvVar(name="OH_SECRET_KEY", value=canvas_secret_key),
+                        client.V1EnvVar(name="SERVICE_AUTH_TOKEN", value=SERVICE_AUTH_TOKEN),
                     ],
                     resources=client.V1ResourceRequirements(
                         requests={"cpu": "512m", "memory": "1Gi"},

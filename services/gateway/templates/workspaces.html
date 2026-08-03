@@ -65,6 +65,7 @@
     display: flex; align-items: center; justify-content: space-between;
     padding: 0.375rem 0;
   }
+
   .share-row .perm { color: #64748b; font-size: 0.75rem; }
   .add-share { display: flex; gap: 0.5rem; margin-top: 0.5rem; flex-wrap: wrap; }
   .add-share select {
@@ -89,6 +90,7 @@
 <div class="container" id="workspace-list">
   <div class="loading">Loading workspaces…</div>
 </div>
+<div class="container" id="usage-summary"></div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -198,6 +200,23 @@ function workspaceCard(ws) {
   return card;
 }
 
+async function loadUsageSummary() {
+  const el = document.getElementById("usage-summary");
+  try {
+    const resp = await api("/api/usage/summary");
+    const s = await resp.json();
+    const tokens = s.totals.tokens || 0;
+    const quota = s.max_monthly_tokens;
+    const line = quota == null
+      ? `Tokens this month: ${tokens.toLocaleString()} (no quota)`
+      : `Tokens this month: ${tokens.toLocaleString()} / ${quota.toLocaleString()}`
+        + (s.quota_exceeded ? " — quota exceeded" : "");
+    el.innerHTML = `<p style="text-align:center;color:#64748b;font-size:0.8125rem">${line}</p>`;
+  } catch (err) {
+    el.innerHTML = "";
+  }
+}
+
 async function loadShares(id, card) {
   const rows = card.querySelector(`#share-rows-${id}`);
   try {
@@ -290,6 +309,7 @@ async function hibernateWorkspace(id) {
 }
 
 loadWorkspaces();
+loadUsageSummary();
 // Poll for workspace updates every 5s if any workspace is starting/hibernating
 setInterval(async () => {
   try {

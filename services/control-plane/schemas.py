@@ -194,3 +194,52 @@ class ShareOut(BaseModel):
     group_name: str
     permission: str
     created_at: datetime
+
+
+# ─── Usage & quotas ──────────────────────────────────────────────────
+
+USAGE_CATEGORIES = ("tokens", "compute", "storage")
+
+
+class UsageEventIn(BaseModel):
+    category: str = Field(min_length=1, max_length=20)
+    metric: str = Field(min_length=1, max_length=100)
+    amount: int = Field(ge=0)
+    unit: str = Field(min_length=1, max_length=20)
+    workspace_id: Optional[str] = Field(default=None, max_length=255)
+
+
+class UsageIngestRequest(BaseModel):
+    events: list[UsageEventIn] = Field(min_length=1, max_length=1000)
+
+
+class UsageIngestResponse(BaseModel):
+    ok: bool = True
+    quota_exceeded: bool = False
+
+
+class UsageSummaryOut(BaseModel):
+    user_id: str
+    period_start: datetime
+    totals: dict[str, int]  # category -> amount for the current month
+    max_monthly_tokens: Optional[int] = None
+    tokens_remaining: Optional[int] = None
+    quota_exceeded: bool = False
+
+
+class QuotaOut(BaseModel):
+    user_id: str
+    max_monthly_tokens: Optional[int] = None
+    max_storage_gb: Optional[int] = None
+
+
+class QuotaUpdate(BaseModel):
+    max_monthly_tokens: Optional[int] = Field(default=None, ge=0)
+    max_storage_gb: Optional[int] = Field(default=None, ge=0)
+
+
+class UsagePage(BaseModel):
+    events: list[dict]
+    total: int
+    limit: int
+    offset: int

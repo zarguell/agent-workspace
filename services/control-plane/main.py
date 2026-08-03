@@ -29,7 +29,7 @@ from auth import (
 )
 from database import async_session_factory, get_session, init_db
 from idempotency import idempotency_store
-from models import AuditEvent, Group, GroupMember, Session, User, Workspace, WorkspaceShare
+from models import AuditEvent, Group, GroupMember, Quota, Session, UsageEvent, User, Workspace, WorkspaceShare
 from reconciler import reconciler
 from schemas import (
     AddMemberRequest,
@@ -44,9 +44,16 @@ from schemas import (
     LoginResponse,
     Ok,
     Operation,
+    QuotaOut,
+    QuotaUpdate,
     SessionOut,
     ShareOut,
     ShareRequest,
+    USAGE_CATEGORIES,
+    UsageIngestRequest,
+    UsageIngestResponse,
+    UsagePage,
+    UsageSummaryOut,
     WorkspaceOut,
     WorkspaceRoutingStatus,
     WorkspaceStatus,
@@ -1057,6 +1064,179 @@ async def unshare_workspace(request: Request, workspace_id: str, group_id: str):
         )
         await db.commit()
         return Ok().model_dump()
+
+
+# ─── Usage & quotas ──────────────────────────────────────────────────
+
+def _current_period_start() -> datetime:
+    """First instant of the current UTC month (billing period)."""
+    return datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+async def _monthly_totals(db: AsyncSession, user_id: str, period_start: datetime) -> dict[str, int]:
+    """Sum usage by category for *user_id* since *period_start*."""
+    result = await db.execute(
+        select(UsageEvent.category, func.sum(UsageEvent.amount))
+        .where(
+            UsageEvent.user_id == user_id,
+            UsageEvent.period_start == period_start,
+        )
+        .group_by(UsageEvent.category)
+    )
+    return {category: int(total or 0) for category, total in result.all()}
+
+
+async def _get_quota(db: AsyncSession, user_id: str) -> Quota | None:
+    return await db.get(Quota, user_id)
+
+
+@app.post("/api/internal/usage", status_code=201)
+async def ingest_usage(request: Request):
+    """Append usage events reported by workspace agents.
+
+    Token usage is enforced against the user's monthly quota: events are
+    always recorded (full accounting), but the response is 429 once the
+    month's total exceeds ``max_monthly_tokens`` so the agent backs off.
+    """
+    service_user = request.headers.get("X-Service-User", "")
+    if not service_user:
+        return JSONResponse(status_code=401, content=Error(error="Missing X-Service-User").model_dump())
+
+    body = await request.json()
+    data = UsageIngestRequest(**body)
+    async with async_session_factory() as db:
+        user_result = await db.execute(select(User).where(User.username == service_user))
+        user = user_result.scalar_one_or_none()
+        if user is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+
+        period = _current_period_start()
+        token_delta = 0
+        for ev in data.events:
+            if ev.category not in USAGE_CATEGORIES:
+                return JSONResponse(status_code=400, content=Error(error=f"Unknown category '{ev.category}'").model_dump())
+            workspace_id = ev.workspace_id or f"ws-{user.username}"
+            if ev.category == "tokens":
+                token_delta += ev.amount
+            db.add(UsageEvent(
+                user_id=user.user_id,
+                workspace_id=workspace_id,
+                category=ev.category,
+                metric=ev.metric,
+                amount=ev.amount,
+                unit=ev.unit,
+                period_start=period,
+            ))
+        await db.commit()
+
+        quota = await _get_quota(db, user.user_id)
+        if quota and quota.max_monthly_tokens is not None and token_delta > 0:
+            totals = await _monthly_totals(db, user.user_id, period)
+            exceeded = totals.get("tokens", 0) > quota.max_monthly_tokens
+            if exceeded:
+                return JSONResponse(
+                    status_code=429,
+                    content=UsageIngestResponse(ok=True, quota_exceeded=True).model_dump(),
+                )
+
+        return UsageIngestResponse(ok=True).model_dump()
+
+
+@app.get("/api/usage/summary")
+async def usage_summary(request: Request):
+    """Current-month usage totals and quota for the caller's own workspace."""
+    user_id = _get_user_id(request)
+    async with async_session_factory() as db:
+        period = _current_period_start()
+        totals = await _monthly_totals(db, user_id, period)
+        quota = await _get_quota(db, user_id)
+        max_tokens = quota.max_monthly_tokens if quota else None
+        used = totals.get("tokens", 0)
+        return UsageSummaryOut(
+            user_id=user_id,
+            period_start=period,
+            totals=totals,
+            max_monthly_tokens=max_tokens,
+            tokens_remaining=max_tokens - used if max_tokens is not None else None,
+            quota_exceeded=max_tokens is not None and used > max_tokens,
+        ).model_dump()
+
+
+@app.get("/api/admin/usage")
+async def admin_list_usage(
+    request: Request,
+    user_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+    category: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+):
+    if not _check_admin(request):
+        return JSONResponse(status_code=403, content=Error(error="Admin only").model_dump())
+    async with async_session_factory() as db:
+        query = select(UsageEvent)
+        if user_id:
+            query = query.where(UsageEvent.user_id == user_id)
+        if workspace_id:
+            query = query.where(UsageEvent.workspace_id == workspace_id)
+        if category:
+            query = query.where(UsageEvent.category == category)
+
+        total_result = await db.execute(select(func.count()).select_from(query.subquery()))
+        total = total_result.scalar() or 0
+        query = query.order_by(desc(UsageEvent.recorded_at)).limit(limit).offset(offset)
+        result = await db.execute(query)
+        events = [
+            {
+                "id": e.id,
+                "user_id": e.user_id,
+                "workspace_id": e.workspace_id,
+                "category": e.category,
+                "metric": e.metric,
+                "amount": e.amount,
+                "unit": e.unit,
+                "period_start": e.period_start,
+                "recorded_at": e.recorded_at,
+            }
+            for e in result.scalars().all()
+        ]
+        return UsagePage(events=events, total=total, limit=limit, offset=offset).model_dump()
+
+
+@app.get("/api/admin/quotas/{user_id}")
+async def admin_get_quota(request: Request, user_id: str):
+    if not _check_admin(request):
+        return JSONResponse(status_code=403, content=Error(error="Admin only").model_dump())
+    async with async_session_factory() as db:
+        quota = await _get_quota(db, user_id)
+        return QuotaOut(
+            user_id=user_id,
+            max_monthly_tokens=quota.max_monthly_tokens if quota else None,
+            max_storage_gb=quota.max_storage_gb if quota else None,
+        ).model_dump()
+
+
+@app.put("/api/admin/quotas/{user_id}")
+async def admin_set_quota(request: Request, user_id: str):
+    if not _check_admin(request):
+        return JSONResponse(status_code=403, content=Error(error="Admin only").model_dump())
+    body = await request.json()
+    data = QuotaUpdate(**body)
+    async with async_session_factory() as db:
+        quota = await _get_quota(db, user_id)
+        if quota is None:
+            quota = Quota(user_id=user_id)
+            db.add(quota)
+        if data.max_monthly_tokens is not None:
+            quota.max_monthly_tokens = data.max_monthly_tokens
+        if data.max_storage_gb is not None:
+            quota.max_storage_gb = data.max_storage_gb
+        await db.commit()
+        return QuotaOut(
+            user_id=user_id,
+            max_monthly_tokens=quota.max_monthly_tokens,
+            max_storage_gb=quota.max_storage_gb,
+        ).model_dump()
 
 
 # ─── Audit ingestion (internal) ──────────────────────────────────────

@@ -184,6 +184,7 @@ async def test_canvas_keys_backfilled_and_injected_into_deployment(db, monkeypat
     env = _deploy_env(apps)
     assert env["LOCAL_BACKEND_API_KEY"] == fresh.canvas_api_key
     assert env["OH_SECRET_KEY"] == fresh.canvas_secret_key
+    assert env["SERVICE_AUTH_TOKEN"]  # injected so the agent can report usage
 
 
 async def test_canvas_keys_stable_across_reconciles(db, monkeypatch):
