@@ -37,6 +37,7 @@ Living document. Open an issue or PR to suggest changes.
 
 - [ ] **Per-user token tracking** — LLM token usage accounting per user/workspace
 - [ ] **Cost tracking** — aggregate cost visibility by user, group, or project
+- [ ] **Compute usage visibility** — per-user monthly pod-hours / CPU-seconds from the existing usage ledger (already collected), surfaced to users and admins
 
 ## Phase 5: Workspace Flexibility
 

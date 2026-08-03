@@ -11,9 +11,25 @@ from types import SimpleNamespace
 from typing import Optional
 
 import pytest
+import pytest_asyncio
 from kubernetes.client.rest import ApiException
 
 from conftest import seed_user
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _clear_starting_workspaces(db):
+    """The concurrent-start cap counts every 'starting' workspace in the
+    shared test DB, and tests accumulate leftovers between runs. Reset them
+    before each test so the default cap (4) can never starve an unrelated
+    test's start transition."""
+    from sqlalchemy import update
+    from models import Workspace
+    await db.execute(
+        update(Workspace).where(Workspace.state == "starting").values(state="hibernated")
+    )
+    await db.commit()
+    yield
 
 
 # ─── Fake K8s clients ───────────────────────────────────────────────────
@@ -677,3 +693,137 @@ async def test_ensure_namespace_skips_terminating_namespace(db, monkeypatch):
     assert core.created == []
     # State unchanged: retried on the next pass.
     assert (await _fresh_workspace(db, "ws-term-user")).state == "starting"
+
+
+# ─── Final hardening: start capacity, netpol determinism, backoff ──────
+
+
+async def test_requested_defers_at_starting_capacity(db, monkeypatch):
+    """requested→starting honours MAX_CONCURRENT_STARTS: at capacity the
+    workspace stays requested and NO pod resources are created; it
+    transitions once a slot frees."""
+    import reconciler as rec_module
+    user = await seed_user("cap-user", create_workspace=False)
+    await _insert_workspace(db, user, "ws-cap-user", "requested")
+    # A blocker workspace occupying one starting slot.
+    blocker = await seed_user("cap-blocker", create_workspace=False)
+    await _insert_workspace(db, blocker, "ws-cap-blocker", "starting")
+
+    from sqlalchemy import func, select, update
+    from models import Workspace as WS
+    used = (await db.execute(
+        select(func.count()).select_from(WS).where(WS.state == "starting")
+    )).scalar_one()
+    # Cap exactly the current number of starting workspaces → no free slot.
+    monkeypatch.setattr(rec_module, "MAX_CONCURRENT_STARTS", used)
+
+    rec, apps, core, _ = make_reconciler(monkeypatch, {"ready": False})
+    await rec._reconcile_workspace(await _fresh_workspace(db, "ws-cap-user"))
+
+    fresh = await _fresh_workspace(db, "ws-cap-user")
+    assert fresh.state == "requested"  # deferred, not transitioned
+    assert apps.created is False
+    assert core.created == []  # no pod resources created this pass
+
+    # Free a slot → the next pass transitions.
+    await db.execute(
+        update(WS).where(WS.workspace_id == "ws-cap-blocker").values(state="hibernated")
+    )
+    await db.commit()
+    await rec._reconcile_workspace(await _fresh_workspace(db, "ws-cap-user"))
+    assert (await _fresh_workspace(db, "ws-cap-user")).state == "starting"
+
+
+async def test_network_policy_allowlist_builds_identical_specs(db, monkeypatch):
+    """Hostname→IP resolution produces a set; rules must be sorted+deduped so
+    two builds with the same allowlist yield byte-identical specs (no
+    spurious patch on every reconcile)."""
+    from reconciler import socket as rec_socket
+    monkeypatch.setattr(rec_socket, "gethostbyname_ex",
+                        lambda h: (h, [], ["10.0.0.3", "10.0.0.1", "10.0.0.2"]))
+    monkeypatch.setattr(rec_socket, "gethostbyname", lambda h: "10.0.0.1")
+
+    rec, _, _, net = make_reconciler(monkeypatch, {"ready": False})
+    rec._init_k8s()
+    rec._ensure_network_policy("user-id-0005", mode="allowlist", allowlist=["pypi.org"])
+    first = net._policy.to_dict()
+    # Simulate a fresh build (e.g. after a reconciler restart).
+    net._policy = None
+    rec._ensure_network_policy("user-id-0005", mode="allowlist", allowlist=["pypi.org"])
+    second = net._policy.to_dict()
+
+    assert first == second  # identical specs across builds
+    ip_cidrs = [
+        e["to"][0]["ip_block"]["cidr"]
+        for e in first["spec"]["egress"]
+        if (e["to"][0].get("ip_block") or {}).get("cidr")
+    ]
+    # Sorted and deduped: 10.0.0.1 appears once (it came from both the
+    # gethostbyname_ex list and gethostbyname), and the trio is ordered.
+    assert ip_cidrs == ["10.0.0.1/32", "10.0.0.2/32", "10.0.0.3/32"]
+
+
+async def test_backoff_skips_failing_workspace_then_retries(db, monkeypatch):
+    """A workspace whose reconcile raises is skipped for the backoff window;
+    once the window elapses it is retried, and a clean pass resets it."""
+    import reconciler as rec_module
+    monkeypatch.setattr(rec_module, "RECONCILE_BACKOFF", {})  # isolate
+    user = await seed_user("bk-user", create_workspace=False)
+    ws = await _insert_workspace(db, user, "ws-bk-user", "requested")
+
+    rec, apps, _, _ = make_reconciler(monkeypatch, {"ready": False})
+    real_reconcile = rec._reconcile_workspace
+    calls = {"n": 0}
+
+    async def flaky(ws_arg):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("k8s backend down")
+        await real_reconcile(ws_arg)
+
+    monkeypatch.setattr(rec, "_reconcile_workspace", flaky)
+
+    # Pass 1: unhandled exception → failure recorded (backoff now active).
+    await rec._reconcile_with_backoff(ws)
+    failures, _ = rec_module.RECONCILE_BACKOFF[user.user_id]
+    assert failures == 1
+    assert (await _fresh_workspace(db, "ws-bk-user")).state == "requested"
+
+    # Pass 2: still inside the window (30s · 2^1 = 60s) → skipped entirely;
+    # the failure count is neither incremented nor reset by the skip.
+    await rec._reconcile_with_backoff(ws)
+    assert calls["n"] == 1
+    assert rec_module.RECONCILE_BACKOFF[user.user_id][0] == 1
+
+    # Window elapses → retried; the clean pass clears the backoff entry.
+    failures, _ = rec_module.RECONCILE_BACKOFF[user.user_id]
+    rec_module.RECONCILE_BACKOFF[user.user_id] = (
+        failures, datetime.now(timezone.utc) - timedelta(seconds=10_000),
+    )
+    await rec._reconcile_with_backoff(ws)
+    assert calls["n"] == 2
+    assert user.user_id not in rec_module.RECONCILE_BACKOFF
+    assert (await _fresh_workspace(db, "ws-bk-user")).state == "starting"
+
+
+async def test_backoff_benign_early_return_is_clean(db, monkeypatch):
+    """A benign early return (Terminating namespace skip) is a clean pass:
+    it must not count as a failure and clears any recorded failures."""
+    import reconciler as rec_module
+    monkeypatch.setattr(rec_module, "RECONCILE_BACKOFF", {})  # isolate
+    user = await seed_user("bk-term", create_workspace=False)
+    ws = await _insert_workspace(db, user, "ws-bk-term", "starting")
+    rec, apps, core, _ = make_reconciler(monkeypatch, {"ready": False})
+    core.namespace_phase = "Terminating"
+    # Pretend this workspace had failed several times before, with the
+    # backoff window already elapsed so this pass actually runs.
+    rec_module.RECONCILE_BACKOFF[user.user_id] = (
+        3, datetime.now(timezone.utc) - timedelta(seconds=10_000),
+    )
+
+    await rec._reconcile_with_backoff(ws)
+
+    assert user.user_id not in rec_module.RECONCILE_BACKOFF  # reset, not failed
+    assert apps.created is False
+    assert core.created == []
+    assert (await _fresh_workspace(db, "ws-bk-term")).state == "starting"

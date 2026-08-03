@@ -601,14 +601,37 @@ async def start_workspace(request: Request, workspace_id: str):
             ws.image = WORKSPACE_IMAGE
 
         # Transition to starting (started_at is persisted so the reconciler's
-        # starting-deadline has a reference point)
+        # starting-deadline has a reference point). The UPDATE is conditional
+        # on fewer than MAX_CONCURRENT_STARTS OTHER workspaces being
+        # 'starting': the count is evaluated atomically inside the UPDATE, so
+        # concurrent starts can never oversubscribe capacity (no
+        # check-then-update race). A 0-row result means capacity is full.
+        from reconciler import MAX_CONCURRENT_STARTS
         operation_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
-        await db.execute(
+        result = await db.execute(
             update(Workspace)
             .where(Workspace.workspace_id == workspace_id)
+            .where(
+                select(func.count())
+                .select_from(Workspace)
+                .where(
+                    Workspace.state == "starting",
+                    Workspace.workspace_id != workspace_id,
+                )
+                .scalar_subquery()
+                < MAX_CONCURRENT_STARTS
+            )
             .values(state="starting", started_at=now)
         )
+        if result.rowcount == 0:
+            # Capacity full. Deliberately NOT stored under the idempotency
+            # key: capacity is transient, so a retry after a slot frees must
+            # be allowed to succeed rather than replay a cached 503.
+            return JSONResponse(
+                status_code=503,
+                content=Error(error="Starting capacity reached; try again shortly").model_dump(),
+            )
         await record_audit_event(
             db, "workspace.start_requested",
             actor_user_id=_get_user_id(request),

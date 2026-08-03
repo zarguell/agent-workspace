@@ -11,12 +11,12 @@ import os
 import secrets
 import socket
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import httpx
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from audit import record_audit_event
@@ -41,6 +41,20 @@ START_TIMEOUT_MINUTES = _env_int("START_TIMEOUT_MINUTES", 10)
 # Namespace deletion is polled to completion; past this we log loudly and
 # keep retrying (never claim "deleted" while the namespace still exists).
 DELETE_TIMEOUT_MINUTES = _env_int("DELETE_TIMEOUT_MINUTES", 5)
+
+# Concurrent-start capacity: /start and the reconciler's requested→starting
+# transition only fire while fewer than MAX_CONCURRENT_STARTS OTHER
+# workspaces are 'starting'. Enforced with an atomic conditional UPDATE (the
+# count is evaluated inside the UPDATE), so concurrent starts can never
+# oversubscribe capacity — no check-then-update race.
+MAX_CONCURRENT_STARTS = _env_int("MAX_CONCURRENT_STARTS", 4)
+# Per-workspace error backoff: after a reconcile exception the workspace is
+# skipped until 30s · 2^failures (capped) has elapsed since the failure.
+RECONCILE_BACKOFF_BASE_SECONDS = 30
+RECONCILE_BACKOFF_CAP_SECONDS = _env_int("RECONCILE_BACKOFF_CAP_SECONDS", 300)
+# user_id → (consecutive_failures, last_error_at). Module-level so all
+# reconciler instances share one view; entries are cleared on a clean pass.
+RECONCILE_BACKOFF: dict = {}
 WORKSPACE_IMAGE = os.environ.get(
     "WORKSPACE_IMAGE",
     "localhost:5000/agent-workspace:dev-latest",
@@ -508,11 +522,15 @@ class Reconciler:
                     pass
                 # Hostname → current IPs (self-heals on next reconcile).
                 try:
-                    ips = {r[2] for r in socket.gethostbyname_ex(entry)[2]} | {socket.gethostbyname(entry)}
+                    ips = set(socket.gethostbyname_ex(entry)[2]) | {socket.gethostbyname(entry)}
                 except Exception:
                     logger.warning("Could not resolve allowlist host %s — skipping", entry)
                     continue
-                for ip in ips:
+                # Sorted + deduped (the resolution is a set): two builds with
+                # the same allowlist must produce byte-identical specs — set
+                # iteration order is not stable across processes, which
+                # caused a spurious patch on every reconcile.
+                for ip in sorted(ips):
                     egress.append(client.V1NetworkPolicyEgressRule(
                         to=[client.V1NetworkPolicyPeer(ip_block=client.V1IPBlock(cidr=f"{ip}/32"))],
                     ))
@@ -654,21 +672,39 @@ class Reconciler:
             extra_env=await self._build_workspace_env(ws),
         )
 
-
     async def _reconcile_workspace(self, ws: Workspace):
         """Reconcile a single workspace based on its state."""
         user_id = ws.user_id
 
         if ws.state == "requested":
-            # Auto-transition to starting
+            # Auto-transition to starting, gated by the SAME conditional
+            # UPDATE /start uses (fewer than MAX_CONCURRENT_STARTS OTHER
+            # workspaces 'starting'). 0 rows = capacity full: stay requested
+            # and retry next pass — no pod resources this pass.
             if not ws.image:
                 ws.image = WORKSPACE_IMAGE
             async with async_session_factory() as db:
-                await db.execute(
+                result = await db.execute(
                     update(Workspace)
                     .where(Workspace.workspace_id == ws.workspace_id)
+                    .where(
+                        select(func.count())
+                        .select_from(Workspace)
+                        .where(
+                            Workspace.state == "starting",
+                            Workspace.workspace_id != ws.workspace_id,
+                        )
+                        .scalar_subquery()
+                        < MAX_CONCURRENT_STARTS
+                    )
                     .values(state="starting", image=ws.image, started_at=datetime.now(timezone.utc))
                 )
+                if result.rowcount == 0:
+                    logger.info(
+                        "Workspace %s: starting capacity reached, deferring",
+                        ws.workspace_id,
+                    )
+                    return
                 await db.commit()
             logger.info("Workspace %s transitioning requested -> starting", ws.workspace_id)
         if ws.state == "starting":
@@ -935,6 +971,39 @@ class Reconciler:
                     await db.commit()
                 return
 
+    async def _reconcile_with_backoff(self, ws: Workspace):
+        """Reconcile one workspace, honouring the per-workspace error backoff.
+
+        While a workspace is inside its backoff window (recorded after an
+        unhandled reconcile exception) its pass is skipped entirely. A pass
+        that completes without an exception is clean: it clears any recorded
+        failures (benign early returns — e.g. a Terminating namespace —
+        are not failures). Exceptions from _reconcile_workspace are recorded
+        here and never escape to the loop.
+        """
+        user_id = ws.user_id
+        entry = RECONCILE_BACKOFF.get(user_id)
+        if entry is not None:
+            failures, last_error_at = entry
+            delay = min(
+                RECONCILE_BACKOFF_BASE_SECONDS * (2 ** failures),
+                RECONCILE_BACKOFF_CAP_SECONDS,
+            )
+            if datetime.now(timezone.utc) < last_error_at + timedelta(seconds=delay):
+                logger.info(
+                    "Workspace %s in error backoff (%d failures) — skipping this pass",
+                    ws.workspace_id, failures,
+                )
+                return
+        try:
+            await self._reconcile_workspace(ws)
+        except Exception as e:
+            failures, _ = RECONCILE_BACKOFF.get(user_id, (0, None))
+            RECONCILE_BACKOFF[user_id] = (failures + 1, datetime.now(timezone.utc))
+            logger.error("Reconcile error for %s: %s", ws.workspace_id, e)
+            return
+        RECONCILE_BACKOFF.pop(user_id, None)
+
     # ─── Main loop ──────────────────────────────────────────────────────
 
     async def run(self):
@@ -953,9 +1022,8 @@ class Reconciler:
                     )
                     workspaces = result.scalars().all()
 
-                for ws in workspaces:
                     try:
-                        await self._reconcile_workspace(ws)
+                        await self._reconcile_with_backoff(ws)
                     except Exception as e:
                         logger.error("Reconcile error for %s: %s", ws.workspace_id, e)
 

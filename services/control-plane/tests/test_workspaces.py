@@ -7,6 +7,23 @@ shared fixture user would contaminate assertions.
 
 from conftest import seed_user
 
+import pytest_asyncio
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _clear_starting_workspaces(db):
+    """The concurrent-start cap counts every 'starting' workspace in the
+    shared test DB, and tests accumulate leftovers between runs. Reset them
+    before each test so the default cap (4) can never starve an unrelated
+    test's start transition."""
+    from sqlalchemy import update
+    from models import Workspace
+    await db.execute(
+        update(Workspace).where(Workspace.state == "starting").values(state="hibernated")
+    )
+    await db.commit()
+    yield
+
 
 async def _login(client, username, password="pw"):
     return await client.post("/api/login", json={"username": username, "password": password})
@@ -289,3 +306,74 @@ async def test_admin_delete_persists_preserve_pvc(client, db):
     await db.refresh(ws_drop)
     assert ws_drop.state == "deleting"
     assert ws_drop.preserve_pvc is False
+
+
+async def test_start_503_when_capacity_full_and_not_cached(client, db, monkeypatch):
+    """At MAX_CONCURRENT_STARTS the start transition returns 503, and the 503
+    is NOT stored under the idempotency key — retrying the same key after a
+    slot frees must succeed instead of replaying the cached 503."""
+    import reconciler as rec_module
+    await seed_user("cap-full-a")
+    await seed_user("cap-full-b")
+    await _login(client, "cap-full-b")
+
+    from sqlalchemy import func, select, update
+    from models import Workspace
+    # Consume one starting slot with another workspace.
+    await db.execute(
+        update(Workspace).where(Workspace.workspace_id == "ws-cap-full-a").values(state="starting")
+    )
+    await db.commit()
+    # Cap exactly the current number of starting workspaces → no free slot.
+    used = (await db.execute(
+        select(func.count()).select_from(Workspace).where(Workspace.state == "starting")
+    )).scalar_one()
+    monkeypatch.setattr(rec_module, "MAX_CONCURRENT_STARTS", used)
+
+    first = await client.post(
+        "/api/workspaces/ws-cap-full-b/start",
+        headers={"Idempotency-Key": "cap-key-1"},
+    )
+    assert first.status_code == 503
+    assert first.json()["error"] == "Starting capacity reached; try again shortly"
+    # The blocked workspace stayed requested.
+    ws = await db.get(Workspace, "ws-cap-full-b")
+    await db.refresh(ws)
+    assert ws.state == "requested"
+
+    # Free a slot: the SAME key must now succeed — proving the 503 was never
+    # cached under it.
+    await db.execute(
+        update(Workspace).where(Workspace.workspace_id == "ws-cap-full-a").values(state="hibernated")
+    )
+    await db.commit()
+    retry = await client.post(
+        "/api/workspaces/ws-cap-full-b/start",
+        headers={"Idempotency-Key": "cap-key-1"},
+    )
+    assert retry.status_code == 202
+    assert retry.json()["state"] == "starting"
+
+
+async def test_start_succeeds_below_capacity(client, db, monkeypatch):
+    """Below the cap, the start transition succeeds even while other
+    workspaces are starting."""
+    import reconciler as rec_module
+    await seed_user("cap-ok-a")
+    await seed_user("cap-ok-b")
+    await _login(client, "cap-ok-b")
+
+    from sqlalchemy import func, select, update
+    from models import Workspace
+    await db.execute(
+        update(Workspace).where(Workspace.workspace_id == "ws-cap-ok-a").values(state="starting")
+    )
+    await db.commit()
+    used = (await db.execute(
+        select(func.count()).select_from(Workspace).where(Workspace.state == "starting")
+    )).scalar_one()
+    monkeypatch.setattr(rec_module, "MAX_CONCURRENT_STARTS", used + 1)
+
+    resp = await client.post("/api/workspaces/ws-cap-ok-b/start")
+    assert resp.status_code == 202
+    assert resp.json()["state"] == "starting"
