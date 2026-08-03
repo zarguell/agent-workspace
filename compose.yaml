@@ -10,9 +10,9 @@ name: agent-platform-local
 #   open http://localhost:${GATEWAY_PORT:-18088}/ui/login
 #
 # Env overrides: SERVICE_AUTH_TOKEN, SEED_ADMIN_USER, SEED_ADMIN_PASSWORD,
-# WORKSPACE_DEV_HOST, CONTROL_PLANE_PORT, GATEWAY_PORT, POSTGRES_PORT,
-# OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_REDIRECT_URI,
-# OIDC_ADMIN_EMAILS.
+# CORS_ORIGINS, WORKSPACE_DEV_HOST, CONTROL_PLANE_PORT, GATEWAY_PORT,
+# POSTGRES_PORT, OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET,
+# OIDC_REDIRECT_URI, OIDC_ADMIN_EMAILS.
 # (Set them in a .env file next to this file.)
 
 services:
@@ -39,6 +39,9 @@ services:
       SERVICE_AUTH_TOKEN: ${SERVICE_AUTH_TOKEN:-local-token}
       SEED_ADMIN_USER: ${SEED_ADMIN_USER:-admin}
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-admin}
+      # Comma-separated list of allowed browser origins (e.g. the gateway
+      # UI origin). Empty disables cross-origin requests entirely.
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
       DISABLE_RECONCILER: "1"
       WORKSPACE_DEV_HOST: ${WORKSPACE_DEV_HOST:-}
       # Fernet master key for workspace-secret encryption at rest. Change in
@@ -53,6 +56,8 @@ services:
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-local-secret}
       OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-http://agents.local.test:${GATEWAY_PORT:-18088}/api/oidc/callback}
       OIDC_ADMIN_EMAILS: ${OIDC_ADMIN_EMAILS:-admin@example.com}
+      # Dev-only: the mock IdP is plain HTTP; production must use HTTPS.
+      OIDC_ALLOW_INSECURE: "1"
     ports:
       - "${CONTROL_PLANE_PORT:-18011}:80"
     depends_on:
