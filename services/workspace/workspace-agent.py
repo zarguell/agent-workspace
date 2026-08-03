@@ -1,13 +1,12 @@
 #!/usr/bin/python3
 """Workspace agent: readiness, activity, dev-server registration, usage reporting."""
-import json, os, socket, subprocess, sys, time, threading, urllib.request
+import hmac, json, os, socket, subprocess, sys, time, threading, urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 WORKSPACE = os.environ.get("WORKSPACE", "/workspace")
 PORT = int(os.environ.get("AGENT_PORT", "9000"))
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://control-plane:80").rstrip("/")
-SERVICE_AUTH_TOKEN = os.environ.get("SERVICE_AUTH_TOKEN", "")
-USERNAME = os.environ.get("USERNAME", "")
+WORKSPACE_AGENT_TOKEN = os.environ.get("WORKSPACE_AGENT_TOKEN", "")
 WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
 REPORT_INTERVAL = int(os.environ.get("REPORT_INTERVAL", "300"))
 
@@ -23,10 +22,27 @@ class AgentHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(body).encode())
 
+    def _require_token(self):
+        """403 unless the caller presents X-Pod-Token (constant-time compare).
+
+        /health is exempt so the reconciler readiness probe stays open;
+        every other endpoint requires the per-workspace agent token. A
+        missing expected token (env unset) rejects all callers rather than
+        falling open.
+        """
+        supplied = self.headers.get("X-Pod-Token", "")
+        if not WORKSPACE_AGENT_TOKEN or not hmac.compare_digest(supplied, WORKSPACE_AGENT_TOKEN):
+            self._respond(403, {"error": "forbidden"})
+            return False
+        return True
+
     def do_GET(self):
         if self.path == "/health":
             self._respond(200, {"status": "ok"})
-        elif self.path == "/ready":
+            return
+        if not self._require_token():
+            return
+        if self.path == "/ready":
             # Check Paseo and code-server
             services = {}
             for name, port, path in [
@@ -60,8 +76,9 @@ class AgentHandler(BaseHTTPRequestHandler):
             self._respond(404, {"error": "not found"})
 
     def do_POST(self):
+        if not self._require_token():
+            return
         if self.path.startswith("/expose/"):
-            port_str = self.path.split("/expose/")[1].split("/")[0]
             try:
                 port = int(port_str)
             except ValueError:
@@ -124,7 +141,7 @@ def report_usage_loop():
             except Exception:
                 pass
 
-            if not SERVICE_AUTH_TOKEN or not USERNAME:
+            if not WORKSPACE_AGENT_TOKEN:
                 time.sleep(REPORT_INTERVAL)
                 continue
 
@@ -133,8 +150,7 @@ def report_usage_loop():
                 data=json.dumps({"events": events}).encode(),
                 headers={
                     "Content-Type": "application/json",
-                    "X-Service-Auth": SERVICE_AUTH_TOKEN,
-                    "X-Service-User": USERNAME,
+                    "X-Workspace-Token": WORKSPACE_AGENT_TOKEN,
                 },
                 method="POST",
             )

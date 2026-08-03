@@ -99,6 +99,33 @@ async def test_start_conflict_same_key_different_body(client):
     assert second.json()["error"] == "Idempotency key conflict: different request body"
 
 
+async def test_idempotency_cache_never_served_across_users(client):
+    """User B replaying user A's Idempotency-Key must NOT get A's cached 200.
+
+    Regresses the disclosure where the cache was consulted before authz and
+    keyed without the caller: B would have received A's cached start response.
+    """
+    await seed_user("idem-owner")
+    await seed_user("idem-stranger")
+    await _login(client, "idem-owner")
+
+    first = await client.post(
+        "/api/workspaces/ws-idem-owner/start",
+        headers={"Idempotency-Key": "cross-user-key"},
+    )
+    assert first.status_code == 202  # A's response is now cached
+
+    # Switch to a user with no access to A's workspace.
+    await client.post("/api/logout")
+    await _login(client, "idem-stranger")
+
+    replay = await client.post(
+        "/api/workspaces/ws-idem-owner/start",
+        headers={"Idempotency-Key": "cross-user-key"},
+    )
+    assert replay.status_code in (403, 404)  # never the cached 200
+
+
 async def test_start_noop_when_already_starting(client):
     await seed_user("noop-user")
     await _login(client, "noop-user")
@@ -239,3 +266,26 @@ async def test_list_shares_owner_only(client):
     assert resp.status_code == 403
 
 
+async def test_admin_delete_persists_preserve_pvc(client, db):
+    """The admin delete's preserve_pvc flag is persisted on the workspace row
+    so the reconciler can decide whether to tear down the PVC/namespace."""
+    await seed_user("adm-delete", is_admin=True)
+    await seed_user("del-a")
+    await seed_user("del-b")
+    await _login(client, "adm-delete")
+
+    keep = await client.delete("/api/admin/workspaces/ws-del-a?preserve_pvc=true")
+    assert keep.status_code == 202
+    drop = await client.delete("/api/admin/workspaces/ws-del-b")
+    assert drop.status_code == 202
+
+    from models import Workspace
+    ws_keep = await db.get(Workspace, "ws-del-a")
+    await db.refresh(ws_keep)
+    assert ws_keep.state == "deleting"
+    assert ws_keep.preserve_pvc is True
+
+    ws_drop = await db.get(Workspace, "ws-del-b")
+    await db.refresh(ws_drop)
+    assert ws_drop.state == "deleting"
+    assert ws_drop.preserve_pvc is False

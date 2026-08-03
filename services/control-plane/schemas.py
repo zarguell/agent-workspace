@@ -104,6 +104,7 @@ class WorkspaceRoutingStatus(BaseModel):
     workspace_id: str
     state: str
     cluster_ip: Optional[str] = None
+    agent_token: str = ""
     ports: dict[str, int] = {"paseo": 6767, "code_server": 8080, "agent": 9000}
     agent_ready: bool = False
     exposures: list[Exposure] = []

@@ -6,10 +6,11 @@ _check_pod_ready is monkeypatched to a controllable result. Everything else
 real test Postgres.
 """
 
-import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Optional
 
+import pytest
 from kubernetes.client.rest import ApiException
 
 from conftest import seed_user
@@ -25,6 +26,7 @@ class FakeAppsV1Api:
         self.created_body = None
         self.patch_replicas: list = []
         self.deployment_exists = False
+        self.deleted: list[tuple] = []
 
     def read_namespaced_deployment(self, name, namespace):
         if not self.deployment_exists:
@@ -42,13 +44,26 @@ class FakeAppsV1Api:
         else:
             self.patch_replicas.append(body.spec.replicas)
 
+    def delete_namespaced_deployment(self, name, namespace):
+        self.deleted.append(("delete_namespaced_deployment", name, namespace))
+        if not self.deployment_exists:
+            raise ApiException(status=404)
+        self.deployment_exists = False
+
 
 
 class FakeCoreV1Api:
-    """Any read_* 404s (resource absent → reconciler creates); create_* recorded."""
+    """Any read_* 404s (resource absent → reconciler creates); create_* recorded.
+
+    Namespace lifecycle is stateful: `namespace_phase` is None (absent) until
+    created (Active), then Terminating once delete_namespace is issued, then
+    None again when the test simulates the namespace finally going away.
+    """
 
     def __init__(self):
         self.created: list[tuple] = []
+        self.deleted: list[tuple] = []
+        self.namespace_phase: Optional[str] = None
 
     def _read_404(self, *args, **kwargs):
         raise ApiException(status=404)
@@ -61,6 +76,29 @@ class FakeCoreV1Api:
                 self.created.append((name, args, kwargs))
             return _record
         raise AttributeError(name)
+
+    def read_namespace(self, name):
+        if self.namespace_phase is None:
+            raise ApiException(status=404)
+        return SimpleNamespace(status=SimpleNamespace(phase=self.namespace_phase))
+
+    def create_namespace(self, body):
+        self.created.append(("create_namespace", (body,), {}))
+        self.namespace_phase = "Active"
+
+    def delete_namespace(self, name):
+        self.deleted.append(("delete_namespace", name))
+        if self.namespace_phase is not None:
+            self.namespace_phase = "Terminating"
+
+    def delete_namespaced_service(self, name, namespace):
+        self.deleted.append(("delete_namespaced_service", name, namespace))
+
+    def delete_namespaced_resource_quota(self, name, namespace):
+        self.deleted.append(("delete_namespaced_resource_quota", name, namespace))
+
+    def delete_namespaced_service_account(self, name, namespace):
+        self.deleted.append(("delete_namespaced_service_account", name, namespace))
 
 class FakeNetworkingV1Api(FakeCoreV1Api):
     """Stateful for network policies: read returns the stored policy once
@@ -82,6 +120,10 @@ class FakeNetworkingV1Api(FakeCoreV1Api):
     def patch_namespaced_network_policy(self, name, namespace, body):
         self._policy = body
         self.created.append(("patch_namespaced_network_policy", (name, namespace, body), {}))
+
+    def delete_namespaced_network_policy(self, name, namespace):
+        self.deleted.append(("delete_namespaced_network_policy", name, namespace))
+        self._policy = None
 def make_reconciler(monkeypatch, ready_holder):
     """Build a Reconciler wired to fakes; returns (rec, apps, core, net)."""
     from reconciler import Reconciler
@@ -188,16 +230,74 @@ async def test_canvas_keys_backfilled_and_injected_into_deployment(db, monkeypat
     rec, apps, _, _ = make_reconciler(monkeypatch, ready)
     await rec._reconcile_workspace(await _fresh_workspace(db, ws_id))
 
+    from secrets_store import SECRETS_STABLE, decrypt_value
+
     fresh = await _fresh_workspace(db, ws_id)
     assert fresh.canvas_api_key
     assert fresh.canvas_secret_key
-    assert len(fresh.canvas_api_key) == 64  # token_hex(32)
-    assert len(fresh.canvas_secret_key) == 64
+    assert SECRETS_STABLE  # conftest pins SECRETS_MASTER_KEY for the suite
+    # At rest the backfilled values are Fernet tokens, not plaintext — DB
+    # readers and backup dumps can't see the keys (audit M5).
+    assert fresh.canvas_api_key.startswith("gAAAAA")
+    assert fresh.canvas_secret_key.startswith("gAAAAA")
+    assert len(decrypt_value(fresh.canvas_api_key)) == 64  # token_hex(32)
+    assert len(decrypt_value(fresh.canvas_secret_key)) == 64
+    assert fresh.agent_token  # backfilled alongside the canvas keys
+    assert len(fresh.agent_token) == 43  # secrets.token_urlsafe(32)
 
     env = _deploy_env(apps)
-    assert env["LOCAL_BACKEND_API_KEY"] == fresh.canvas_api_key
-    assert env["OH_SECRET_KEY"] == fresh.canvas_secret_key
-    assert env["SERVICE_AUTH_TOKEN"]  # injected so the agent can report usage
+    # The pod receives the DECRYPTED plaintext keys, never the ciphertext.
+    assert env["LOCAL_BACKEND_API_KEY"] == decrypt_value(fresh.canvas_api_key)
+    assert env["OH_SECRET_KEY"] == decrypt_value(fresh.canvas_secret_key)
+    # The pod authenticates usage reports with its own per-workspace token;
+    # the shared gateway secret is no longer injected into pods.
+    assert env["WORKSPACE_AGENT_TOKEN"] == fresh.agent_token
+    assert "SERVICE_AUTH_TOKEN" not in env
+
+
+async def test_canvas_keys_legacy_plaintext_injected_verbatim(db, monkeypatch):
+    """Pre-encryption rows store plaintext canvas keys; they must be
+    injected as-is (no Fernet prefix -> no decrypt attempt, no rewrite)."""
+    user = await seed_user("legacy-plain", create_workspace=False)
+    ws_id = "ws-legacy-plain"
+    from sqlalchemy import text
+    await db.execute(text(
+        "INSERT INTO workspaces (workspace_id, user_id, state, image, idle_timeout_minutes, network_mode, egress_allowlist, canvas_api_key, canvas_secret_key, created_at) "
+        "VALUES (:id, :uid, 'starting', '', 15, 'open', '[]'::jsonb, :api, :sec, now())"
+    ), {"id": ws_id, "uid": str(user.user_id), "api": "legacy-api-key-0001", "sec": "legacy-secret-key-0001"})
+    await db.commit()
+
+    ready = {"ready": False}
+    rec, apps, _, _ = make_reconciler(monkeypatch, ready)
+    await rec._reconcile_workspace(await _fresh_workspace(db, ws_id))
+
+    # Legacy row untouched (no re-encryption) and injected verbatim.
+    fresh = await _fresh_workspace(db, ws_id)
+    assert fresh.canvas_api_key == "legacy-api-key-0001"
+    assert fresh.canvas_secret_key == "legacy-secret-key-0001"
+    env = _deploy_env(apps)
+    assert env["LOCAL_BACKEND_API_KEY"] == "legacy-api-key-0001"
+    assert env["OH_SECRET_KEY"] == "legacy-secret-key-0001"
+
+
+def test_canvas_key_marker_decrypt_unit():
+    """decrypt_value_if_encrypted: Fernet tokens (gAAAAA prefix) decrypt to
+    plaintext, legacy values pass through unchanged, and an undecryptable
+    token raises instead of leaking ciphertext."""
+    from secrets_store import SECRETS_STABLE, SecretDecryptionError, decrypt_value_if_encrypted, encrypt_value
+
+    assert SECRETS_STABLE  # conftest pins SECRETS_MASTER_KEY for the suite
+
+    token = encrypt_value("plaintext-credential")
+    assert token.startswith("gAAAAA")
+    assert decrypt_value_if_encrypted(token) == "plaintext-credential"
+    # Legacy plaintext (pre-encryption rows) passes through unchanged.
+    assert decrypt_value_if_encrypted("legacy-plaintext") == "legacy-plaintext"
+    assert decrypt_value_if_encrypted("") == ""
+    # A token that cannot be decrypted must raise loudly, never return it.
+    tampered = token[:8] + ("A" if token[8] != "A" else "B") + token[9:]
+    with pytest.raises(SecretDecryptionError):
+        decrypt_value_if_encrypted(tampered)
 
 
 async def test_canvas_keys_stable_across_reconciles(db, monkeypatch):
@@ -213,6 +313,39 @@ async def test_canvas_keys_stable_across_reconciles(db, monkeypatch):
     second = await _fresh_workspace(db, "ws-stable-user")
     assert second.canvas_api_key == first.canvas_api_key
     assert second.canvas_secret_key == first.canvas_secret_key
+
+
+async def test_agent_token_generated_persisted_and_injected(db, monkeypatch):
+    user = await seed_user("tok-user", create_workspace=False)
+    ws = await _insert_workspace(db, user, "ws-tok-user", "starting")
+
+    ready = {"ready": False}
+    rec, apps, _, _ = make_reconciler(monkeypatch, ready)
+    await rec._reconcile_workspace(ws)
+
+    fresh = await _fresh_workspace(db, "ws-tok-user")
+    assert fresh.agent_token
+    assert len(fresh.agent_token) == 43  # secrets.token_urlsafe(32)
+
+    env = _deploy_env(apps)
+    assert env["WORKSPACE_AGENT_TOKEN"] == fresh.agent_token
+    assert env["CONTROL_PLANE_URL"].startswith("http://control-plane")
+    assert "SERVICE_AUTH_TOKEN" not in env
+
+
+async def test_agent_token_stable_across_reconciles(db, monkeypatch):
+    user = await seed_user("tok-stable", create_workspace=False)
+    ws = await _insert_workspace(db, user, "ws-tok-stable", "starting")
+
+    ready = {"ready": False}
+    rec, apps, _, _ = make_reconciler(monkeypatch, ready)
+    await rec._reconcile_workspace(ws)
+    first = await _fresh_workspace(db, "ws-tok-stable")
+
+    await rec._reconcile_workspace(first)
+    second = await _fresh_workspace(db, "ws-tok-stable")
+    assert second.agent_token == first.agent_token
+    assert apps.patch_replicas == []  # deployment already present: no churn
 
 
 async def test_running_idle_pending_hibernating_hibernated(db, monkeypatch):
@@ -258,6 +391,41 @@ async def test_running_stays_running_when_active(db, monkeypatch):
     rec, _, _, _ = make_reconciler(monkeypatch, ready)
     await rec._reconcile_workspace(ws)
     assert (await _fresh_workspace(db, "ws-active2")).state == "running"
+
+
+async def test_running_recreates_deleted_deployment(db, monkeypatch):
+    user = await seed_user("h4-user", create_workspace=False)
+    ws = await _insert_workspace(db, user, "ws-h4-user", "running")
+
+    # Pod unreachable AND the Deployment is gone (e.g. kubectl delete
+    # deployment while running): the workspace must recover instead of
+    # bricking in "running" forever.
+    ready = {"ready": False}
+    rec, apps, _, _ = make_reconciler(monkeypatch, ready)
+    assert apps.deployment_exists is False
+
+    await rec._reconcile_workspace(ws)
+
+    assert apps.created is True  # Deployment recreated via the ensure path
+    fresh = await _fresh_workspace(db, "ws-h4-user")
+    assert fresh.state == "running"  # no state regression
+    env = _deploy_env(apps)
+    assert env["WORKSPACE_AGENT_TOKEN"] == fresh.agent_token
+
+
+async def test_hibernating_recreates_missing_deployment(db, monkeypatch):
+    user = await seed_user("h4-hib", create_workspace=False)
+    ws = await _insert_workspace(db, user, "ws-h4-hib", "hibernating")
+
+    ready = {"ready": False}
+    rec, apps, _, _ = make_reconciler(monkeypatch, ready)
+    await rec._reconcile_workspace(ws)
+
+    # Deployment was deleted before the scale-down pass: hibernation
+    # recreates it (so the workspace stays resumable) then scales to 0.
+    assert apps.created is True
+    assert apps.patch_replicas == [0]
+    assert (await _fresh_workspace(db, "ws-h4-hib")).state == "hibernated"
 
 
 async def test_get_cluster_ip_resilient_without_k8s(monkeypatch):
@@ -306,6 +474,17 @@ async def test_network_policy_open_shape(db, monkeypatch):
     spec = created[0][1][1].to_dict()["spec"]
     assert spec["policy_types"] == ["Ingress"]
     assert spec["egress"] is None  # egress unrestricted
+    # Ingress is locked down: gateway (all ports) + control-plane (:9000 probe).
+    ingress = spec["ingress"]
+    assert len(ingress) == 2
+    gw = ingress[0]["_from"][0]
+    assert gw["namespace_selector"]["match_labels"] == {"kubernetes.io/metadata.name": "agent-platform"}
+    assert gw["pod_selector"]["match_labels"] == {"app.kubernetes.io/name": "gateway"}
+    assert not ingress[0]["ports"]  # gateway reaches the full proxy surface
+    cp = ingress[1]
+    assert cp["_from"][0]["pod_selector"]["match_labels"] == {"app.kubernetes.io/name": "control-plane"}
+    assert cp["ports"][0]["port"] == 9000
+    assert cp["ports"][0]["protocol"] == "TCP"
 
 
 async def test_network_policy_offline_denies_egress(db, monkeypatch):
@@ -357,3 +536,144 @@ async def test_network_policy_patched_when_mode_changes(db, monkeypatch):
     patched = [c for c in net.created if c[0] == "patch_namespaced_network_policy"]
     assert len(created) == 1
     assert len(patched) == 1
+
+# ─── Wave 4: live idle, start deadline, deletion ────────────────────────
+
+async def test_idle_pending_returns_to_running_on_fresh_activity(db, monkeypatch):
+    """Fresh activity during idle_pending cancels the pending hibernate."""
+    user = await seed_user("idle-fresh", create_workspace=False)
+    ws = await _insert_workspace(
+        db, user, "ws-idle-fresh", "idle_pending",
+        last_activity_at=datetime.now(timezone.utc) - timedelta(seconds=5),
+        idle_timeout_minutes=15,
+    )
+    rec, _, _, _ = make_reconciler(monkeypatch, {"ready": True})
+    await rec._reconcile_workspace(ws)
+    assert (await _fresh_workspace(db, "ws-idle-fresh")).state == "running"
+
+
+async def test_idle_pending_stays_pending_in_grace_window(db, monkeypatch):
+    """Past the idle timeout but inside the grace window: stay idle_pending
+    (no running↔idle_pending oscillation)."""
+    user = await seed_user("idle-grace", create_workspace=False)
+    ws = await _insert_workspace(
+        db, user, "ws-idle-grace", "idle_pending",
+        # 15m10s idle: 15m timeout + 30s grace → inside the window.
+        last_activity_at=datetime.now(timezone.utc) - timedelta(minutes=15, seconds=10),
+        idle_timeout_minutes=15,
+    )
+    rec, _, _, _ = make_reconciler(monkeypatch, {"ready": True})
+    await rec._reconcile_workspace(ws)
+    assert (await _fresh_workspace(db, "ws-idle-grace")).state == "idle_pending"
+
+
+async def test_starting_times_out_to_failed(db, monkeypatch):
+    """A workspace stuck in starting past START_TIMEOUT_MINUTES is failed."""
+    user = await seed_user("slow-start", create_workspace=False)
+    ws = await _insert_workspace(
+        db, user, "ws-slow-start", "starting",
+        started_at=datetime.now(timezone.utc) - timedelta(minutes=15),
+    )
+    rec, apps, _, _ = make_reconciler(monkeypatch, {"ready": False})
+    await rec._reconcile_workspace(ws)
+    fresh = await _fresh_workspace(db, "ws-slow-start")
+    assert fresh.state == "failed"
+    assert apps.created is False  # no K8s work for a timed-out start
+
+
+async def test_starting_without_started_at_treated_fresh(db, monkeypatch):
+    """A NULL started_at never trips the deadline (treated as fresh)."""
+    user = await seed_user("no-started", create_workspace=False)
+    ws = await _insert_workspace(db, user, "ws-no-started", "starting")
+    rec, _, _, _ = make_reconciler(monkeypatch, {"ready": False})
+    await rec._reconcile_workspace(ws)
+    assert (await _fresh_workspace(db, "ws-no-started")).state == "starting"
+
+
+async def test_delete_preserve_pvc_keeps_namespace_and_hibernates(db, monkeypatch):
+    """preserve_pvc delete: pod-facing resources removed, namespace + PVC
+    kept, state=hibernated (restartable, data intact)."""
+    user = await seed_user("preserve", create_workspace=False)
+    ws = await _insert_workspace(db, user, "ws-preserve", "deleting")
+    # Set on the ORM instance directly: the admin handler plumbing
+    # (main.py) will persist this column; the reconciler reads it
+    # defensively either way.
+    ws.preserve_pvc = True
+
+    rec, apps, core, net = make_reconciler(monkeypatch, {"ready": False})
+    rec._init_k8s()
+    core.namespace_phase = "Active"  # namespace exists with data
+
+    await rec._reconcile_workspace(ws)
+
+    fresh = await _fresh_workspace(db, "ws-preserve")
+    assert fresh.state == "hibernated"
+
+    deleted = {d[0] for d in apps.deleted + core.deleted + net.deleted}
+    assert {"delete_namespaced_deployment", "delete_namespaced_service",
+            "delete_namespaced_network_policy", "delete_namespaced_resource_quota",
+            "delete_namespaced_service_account"} <= deleted
+    # Namespace and PVC survive — data intact, restartable.
+    assert "delete_namespace" not in deleted
+    assert "delete_namespaced_persistent_volume_claim" not in deleted
+    assert core.namespace_phase == "Active"
+
+
+async def test_delete_marks_deleted_only_after_namespace_404(db, monkeypatch):
+    """Full teardown keeps state=deleting until the namespace reads 404."""
+    user = await seed_user("del-wait", create_workspace=False)
+    ws = await _insert_workspace(db, user, "ws-del-wait", "deleting")
+    rec, _, core, _ = make_reconciler(monkeypatch, {"ready": False})
+    rec._init_k8s()
+    core.namespace_phase = "Active"
+
+    # Pass 1: deletion issued, namespace still exists → stays deleting.
+    await rec._reconcile_workspace(ws)
+    assert (await _fresh_workspace(db, "ws-del-wait")).state == "deleting"
+    assert any(d[0] == "delete_namespace" for d in core.deleted)
+    assert core.namespace_phase == "Terminating"
+
+    # Pass 2: namespace still Terminating → still deleting.
+    await rec._reconcile_workspace(await _fresh_workspace(db, "ws-del-wait"))
+    assert (await _fresh_workspace(db, "ws-del-wait")).state == "deleting"
+
+    # Pass 3: namespace finally gone (read 404s) → deleted.
+    core.namespace_phase = None
+    await rec._reconcile_workspace(await _fresh_workspace(db, "ws-del-wait"))
+    assert (await _fresh_workspace(db, "ws-del-wait")).state == "deleted"
+
+
+async def test_delete_stuck_terminating_logs_loudly_and_keeps_deleting(db, monkeypatch, caplog):
+    """A namespace stuck Terminating past DELETE_TIMEOUT_MINUTES logs loudly
+    and stays deleting — never claims deleted while the namespace exists."""
+    import logging
+    user = await seed_user("del-stuck", create_workspace=False)
+    ws = await _insert_workspace(db, user, "ws-del-stuck", "deleting")
+    rec, _, core, _ = make_reconciler(monkeypatch, {"ready": False})
+    rec._init_k8s()
+    core.namespace_phase = "Active"
+    await rec._reconcile_workspace(ws)
+    assert (await _fresh_workspace(db, "ws-del-stuck")).state == "deleting"
+
+    # Simulate the namespace stuck well past DELETE_TIMEOUT_MINUTES.
+    rec._ns_delete_started[ws.user_id] = datetime.now(timezone.utc) - timedelta(minutes=30)
+    with caplog.at_level(logging.ERROR, logger="control-plane.reconciler"):
+        await rec._reconcile_workspace(await _fresh_workspace(db, "ws-del-stuck"))
+    assert (await _fresh_workspace(db, "ws-del-stuck")).state == "deleting"
+    assert "stuck Terminating" in caplog.text
+
+
+async def test_ensure_namespace_skips_terminating_namespace(db, monkeypatch):
+    """Resources are not created into a Terminating (dying) namespace."""
+    user = await seed_user("term-user", create_workspace=False)
+    ws = await _insert_workspace(db, user, "ws-term-user", "starting")
+    rec, apps, core, _ = make_reconciler(monkeypatch, {"ready": False})
+    core.namespace_phase = "Terminating"
+
+    await rec._reconcile_workspace(ws)
+
+    assert rec._ensure_namespace(user.user_id) is False
+    assert apps.created is False
+    assert core.created == []
+    # State unchanged: retried on the next pass.
+    assert (await _fresh_workspace(db, "ws-term-user")).state == "starting"

@@ -1,9 +1,13 @@
 """Idempotency key store.
 
-In-memory dict keyed by (idempotency_key, endpoint, workspace_id, body_hash).
-On retry with same key+body: return stored (status, body).
+In-memory dict keyed by (idempotency_key, endpoint, workspace_id, user_id,
+body_hash).  On retry with same key+body: return stored (status, body).
 On retry with same key but different body: 409 Conflict.
 Keys expire after IDEMPOTENCY_TTL_SECONDS.
+
+The caller's user_id is part of the key so a cached response is never
+replayable by a different user (authorization is enforced before the cache
+consult in the endpoints, this is defense in depth).
 """
 
 import hashlib
@@ -19,23 +23,23 @@ class IdempotencyStore:
     def __init__(self):
         self._store: dict[str, tuple[int, int, str]] = {}  # key -> (expires_at, status, body)
 
-    def _make_lookup_key(self, idempotency_key: str, endpoint: str, workspace_id: str) -> str:
-        """Stable prefix shared by every entry with this (key, endpoint, ws).
+    def _make_lookup_key(self, idempotency_key: str, endpoint: str, workspace_id: str, user_id: str) -> str:
+        """Stable prefix shared by every entry with this (key, endpoint, ws, user).
 
         Entries are stored under ``lookup_prefix + body_fingerprint`` so
         ``check_conflict`` can find siblings by prefix match.
         """
-        raw = f"{idempotency_key}|{endpoint}|{workspace_id}"
+        raw = f"{idempotency_key}|{endpoint}|{workspace_id}|{user_id}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-    def _make_key(self, idempotency_key: str, endpoint: str, workspace_id: str, body: Optional[bytes]) -> str:
+    def _make_key(self, idempotency_key: str, endpoint: str, workspace_id: str, user_id: str, body: Optional[bytes]) -> str:
         body_hash = hashlib.sha256(body or b"").hexdigest()[:16] if body else "none"
-        return f"{self._make_lookup_key(idempotency_key, endpoint, workspace_id)}{body_hash}"
+        return f"{self._make_lookup_key(idempotency_key, endpoint, workspace_id, user_id)}{body_hash}"
 
-    def get(self, idempotency_key: str, endpoint: str, workspace_id: str, body: Optional[bytes]) -> Optional[tuple[int, str]]:
+    def get(self, idempotency_key: str, endpoint: str, workspace_id: str, user_id: str, body: Optional[bytes]) -> Optional[tuple[int, str]]:
         """Return (status, response_body) if a matching idempotent result exists, else None."""
         self._evict()
-        key = self._make_key(idempotency_key, endpoint, workspace_id, body)
+        key = self._make_key(idempotency_key, endpoint, workspace_id, user_id, body)
         entry = self._store.get(key)
         if entry is None:
             return None
@@ -45,20 +49,21 @@ class IdempotencyStore:
             return None
         return (status, body_str)
 
-    def check_conflict(self, idempotency_key: str, endpoint: str, workspace_id: str, body: Optional[bytes]) -> bool:
+    def check_conflict(self, idempotency_key: str, endpoint: str, workspace_id: str, user_id: str, body: Optional[bytes]) -> bool:
         """Return True if the same key was used with a different body (409 conflict)."""
         self._evict()
-        lookup = self._make_lookup_key(idempotency_key, endpoint, workspace_id)
+        lookup = self._make_lookup_key(idempotency_key, endpoint, workspace_id, user_id)
         for k in list(self._store.keys()):
-            if k.startswith(lookup) and k != self._make_key(idempotency_key, endpoint, workspace_id, body):
+            if k.startswith(lookup) and k != self._make_key(idempotency_key, endpoint, workspace_id, user_id, body):
                 return True
         return False
 
-    def set(self, idempotency_key: str, endpoint: str, workspace_id: str, body: Optional[bytes], status: int, response_body: str):
+    def set(self, idempotency_key: str, endpoint: str, workspace_id: str, user_id: str, body: Optional[bytes], status: int, response_body: str):
         """Store the result for this idempotency key."""
-        key = self._make_key(idempotency_key, endpoint, workspace_id, body)
+        key = self._make_key(idempotency_key, endpoint, workspace_id, user_id, body)
         expires_at = time.monotonic() + IDEMPOTENCY_TTL_SECONDS
         self._store[key] = (expires_at, status, response_body)
+
 
     def _evict(self):
         now = time.monotonic()

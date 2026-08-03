@@ -15,6 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# main.py fail-fasts at import when SERVICE_AUTH_TOKEN is unset; it must be
+# configured before any control-plane module import (all lazy, in fixtures).
 os.environ.setdefault("SERVICE_AUTH_TOKEN", "test-service-token")
 # Fixed Fernet key so encrypted secrets are readable across tests.
 os.environ.setdefault("SECRETS_MASTER_KEY", "Y8In5fgHjeCCJIB2Znv0OHOsFMHAW9vG844VH-L3Ass=")
@@ -116,6 +118,15 @@ async def _clear_idempotency():
 
 
 @pytest_asyncio.fixture(autouse=True)
+async def _clear_login_attempts():
+    """The login throttle store is a process-global singleton; isolate tests."""
+    from main import LOGIN_ATTEMPT_STORE
+    LOGIN_ATTEMPT_STORE.clear()
+    yield
+    LOGIN_ATTEMPT_STORE.clear()
+
+
+@pytest_asyncio.fixture(autouse=True)
 async def _reset_oidc_state():
     """OIDC discovery/JWKS caches and the state store are process-global."""
     import oidc
@@ -135,7 +146,7 @@ def service_token():
 
 # ─── Seeding helpers ────────────────────────────────────────────────────
 
-async def seed_user(username, password="pw", is_admin=False, create_workspace=True):
+async def seed_user(username, password="pw", is_admin=False, create_workspace=True, agent_token=None):
     """Insert a user (and optionally their workspace) idempotently."""
     from sqlalchemy import select
     from auth import hash_password
@@ -162,6 +173,7 @@ async def seed_user(username, password="pw", is_admin=False, create_workspace=Tr
                     user_id=user.user_id,
                     state="requested",
                     image="",
+                    agent_token=agent_token or f"tok-{username}",
                 ))
         await db.commit()
         return user

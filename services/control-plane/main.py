@@ -9,6 +9,7 @@ import logging
 import asyncio
 import os
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -33,7 +34,7 @@ from idempotency import idempotency_store
 from models import AuditEvent, Group, GroupMember, McpServer, Quota, Session, UsageEvent, User, Workspace, WorkspaceSecret, WorkspaceShare
 from oidc import router as oidc_router
 from reconciler import reconciler
-from secrets_store import decrypt_value, encrypt_value
+from secrets_store import SecretDecryptionError, decrypt_value, encrypt_value
 from schemas import (
     NetworkConfigOut,
     NetworkConfigUpdate,
@@ -75,10 +76,37 @@ from schemas import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("control-plane")
 
-SERVICE_AUTH_TOKEN = os.environ.get("SERVICE_AUTH_TOKEN", "internal-service-token")
+SERVICE_AUTH_TOKEN = os.environ.get("SERVICE_AUTH_TOKEN")
+if not SERVICE_AUTH_TOKEN:
+    raise RuntimeError(
+        "SERVICE_AUTH_TOKEN must be set: it authenticates gateway-originated "
+        "internal calls (routing, MCP, audit). Pod-originated calls "
+        "authenticate with per-workspace tokens (X-Workspace-Token) instead."
+    )
 CORRELATION_ID_HEADER = "X-Correlation-Id"
 REQUEST_ID_HEADER = "X-Request-Id"
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+# Login throttling: bound credential-stuffing attempts per (client IP, username).
+# In-memory (uvicorn single process, replicas: 1).
+LOGIN_MAX_ATTEMPTS = 10
+LOGIN_WINDOW_SECONDS = 300  # 5 minutes
+LOGIN_ATTEMPT_STORE: dict[tuple[str, str], list[float]] = {}
+
+
+def _login_attempt_throttled(client_ip: str, username: str) -> bool:
+    """Record a login attempt; return True if the caller is over the limit.
+
+    Every attempt is recorded; attempts older than LOGIN_WINDOW_SECONDS are
+    pruned. Returns True once more than LOGIN_MAX_ATTEMPTS attempts remain in
+    the window (i.e. the (LOGIN_MAX_ATTEMPTS + 1)-th attempt is rejected).
+    """
+    now = time.monotonic()
+    key = (client_ip, username)
+    attempts = [t for t in LOGIN_ATTEMPT_STORE.get(key, []) if now - t < LOGIN_WINDOW_SECONDS]
+    attempts.append(now)
+    LOGIN_ATTEMPT_STORE[key] = attempts
+    return len(attempts) > LOGIN_MAX_ATTEMPTS
 
 
 # ─── Lifespan ──────────────────────────────────────────────────────────
@@ -95,9 +123,16 @@ async def lifespan(app: FastAPI):
         count = result.scalar()
         if count == 0:
             from auth import hash_password
-            # Seed default admin user if none exist (configure via env vars)
+            # Seed default admin user if none exist (configure via env vars).
+            # The username defaults to "admin", but the password is REQUIRED:
+            # refusing to start with a well-known default credential.
             admin_username = os.environ.get("SEED_ADMIN_USER", "admin")
-            admin_password = os.environ.get("SEED_ADMIN_PASSWORD", "admin")
+            admin_password = os.environ.get("SEED_ADMIN_PASSWORD")
+            if not admin_password:
+                raise RuntimeError(
+                    "SEED_ADMIN_PASSWORD must be set when the users table is empty "
+                    "(initial admin seeding); refusing to start with a default password."
+                )
             admin = User(
                 username=admin_username,
                 password_hash=hash_password(admin_password),
@@ -139,11 +174,14 @@ app = FastAPI(
 )
 app.include_router(oidc_router)
 
-# CORS — allow gateway to forward requests
+# CORS — origins are env-driven (CORS_ORIGINS, comma-separated). Never
+# wildcard+credentials together (browsers reject it); with no origins
+# configured, cross-origin requests are simply not allowed.
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=bool(CORS_ORIGINS),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -201,12 +239,23 @@ async def session_auth_middleware(request: Request, call_next):
 
 # ─── Middleware: X-Service-Auth (internal endpoints) ──────────────────
 
-SERVICE_AUTH_EXEMPT_PATHS = {"/api/health"}
+SERVICE_AUTH_EXEMPT_PATHS = {
+    "/api/health",
+    # Pod-originated: authenticated by the handler via X-Workspace-Token
+    # (per-workspace secret), not the shared gateway X-Service-Auth token.
+    "/api/internal/usage",
+}
 
 
 @app.middleware("http")
 async def service_auth_middleware(request: Request, call_next):
-    """Validate X-Service-Auth on internal endpoints (/api/internal/*, /api/audit)."""
+    """Validate X-Service-Auth on gateway-originated internal endpoints.
+
+    Routing (/api/internal/workspaces/*), MCP, and audit calls come from the
+    gateway and present the shared X-Service-Auth token. Usage ingestion is
+    pod-originated and exempt: it authenticates per-workspace via
+    X-Workspace-Token inside the handler.
+    """
     path = request.url.path
 
     if not path.startswith("/api/"):
@@ -307,6 +356,20 @@ async def _can_operate_workspace(request: Request, ws: Workspace, db: AsyncSessi
     return await _user_has_share(db, user_id, ws.workspace_id, "operate")
 
 
+async def _service_user_can_access(db: AsyncSession, ws: Workspace, user: User) -> bool:
+    """True if a gateway-identified user may access *ws* via the internal API.
+
+    Shared by the routing and activity endpoints: owner, admin, or member of
+    a group holding operate permission. Anything else is a 404 (no existence
+    leak), mirroring the routing endpoint.
+    """
+    return (
+        user.is_admin
+        or ws.user_id == user.user_id
+        or await _user_has_share(db, user.user_id, ws.workspace_id, "operate")
+    )
+
+
 async def _group_member_role(db: AsyncSession, group_id: str, user_id: str) -> Optional[str]:
     """Return the caller's role in a group, or None if not a member."""
     result = await db.execute(
@@ -341,6 +404,14 @@ async def _workspace_to_out(ws: Workspace, db: AsyncSession) -> WorkspaceOut:
 async def login(request: Request):
     body = await request.json()
     login_data = LoginRequest(**body)
+
+    # Login throttling: max LOGIN_MAX_ATTEMPTS per (client IP, username)
+    # per LOGIN_WINDOW_SECONDS; every attempt is recorded.
+    if _login_attempt_throttled(_get_source_ip(request), login_data.username):
+        return JSONResponse(
+            status_code=429,
+            content=Error(error="Too many login attempts; try again later").model_dump(),
+        )
     async with async_session_factory() as db:
         user = await authenticate_user(db, login_data.username, login_data.password)
         if user is None:
@@ -482,21 +553,13 @@ async def get_workspace(request: Request, workspace_id: str):
 
 @app.post("/api/workspaces/{workspace_id}/start")
 async def start_workspace(request: Request, workspace_id: str):
-    # Idempotency check
     idempotency_key = request.headers.get(IDEMPOTENCY_KEY_HEADER, "")
     endpoint = "start"
     body = await request.body()
-    content_type = request.headers.get("content-type", "")
-
-    if idempotency_key:
-        cached = idempotency_store.get(idempotency_key, endpoint, workspace_id, body)
-        if cached is not None:
-            status, cached_body = cached
-            return Response(content=cached_body, status_code=status, media_type="application/json")
-        if idempotency_store.check_conflict(idempotency_key, endpoint, workspace_id, body):
-            return JSONResponse(status_code=409, content=Error(error="Idempotency key conflict: different request body").model_dump())
 
     async with async_session_factory() as db:
+        # Authorize BEFORE consulting the idempotency cache: a cached 200/409
+        # must never be served to a caller who lacks access.
         ws = await _get_workspace_for_user(request, workspace_id, db)
         if ws is None:
             return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
@@ -505,11 +568,23 @@ async def start_workspace(request: Request, workspace_id: str):
         if not await _can_operate_workspace(request, ws, db):
             return JSONResponse(status_code=403, content=Error(error="Insufficient permission").model_dump())
 
+        # Idempotency check (after authz). The cache key includes the caller's
+        # user_id, so a replay of another user's key can never surface their
+        # cached response.
+        user_id = _get_user_id(request) or ""
+        if idempotency_key:
+            cached = idempotency_store.get(idempotency_key, endpoint, workspace_id, user_id, body)
+            if cached is not None:
+                status, cached_body = cached
+                return Response(content=cached_body, status_code=status, media_type="application/json")
+            if idempotency_store.check_conflict(idempotency_key, endpoint, workspace_id, user_id, body):
+                return JSONResponse(status_code=409, content=Error(error="Idempotency key conflict: different request body").model_dump())
+
         # Reject deleting/deleted
         if ws.state in ("deleting", "deleted"):
             resp = JSONResponse(status_code=409, content=Error(error=f"Cannot start workspace in state '{ws.state}'").model_dump())
             if idempotency_key:
-                idempotency_store.set(idempotency_key, endpoint, workspace_id, body, 409, resp.body.decode())
+                idempotency_store.set(idempotency_key, endpoint, workspace_id, user_id, body, 409, resp.body.decode())
             return resp
 
         # No-op if already running or starting
@@ -517,7 +592,7 @@ async def start_workspace(request: Request, workspace_id: str):
             out = await _workspace_to_out(ws, db)
             resp = JSONResponse(status_code=200, content=out.model_dump(mode="json"))
             if idempotency_key:
-                idempotency_store.set(idempotency_key, endpoint, workspace_id, body, 200, resp.body.decode())
+                idempotency_store.set(idempotency_key, endpoint, workspace_id, user_id, body, 200, resp.body.decode())
             return resp
 
         # Set default image if empty
@@ -525,7 +600,8 @@ async def start_workspace(request: Request, workspace_id: str):
             from reconciler import WORKSPACE_IMAGE
             ws.image = WORKSPACE_IMAGE
 
-        # Transition to starting
+        # Transition to starting (started_at is persisted so the reconciler's
+        # starting-deadline has a reference point)
         operation_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
         await db.execute(
@@ -552,7 +628,7 @@ async def start_workspace(request: Request, workspace_id: str):
         )
         resp = JSONResponse(status_code=202, content=result.model_dump(mode="json"))
         if idempotency_key:
-            idempotency_store.set(idempotency_key, endpoint, workspace_id, body, 202, resp.body.decode())
+            idempotency_store.set(idempotency_key, endpoint, workspace_id, user_id, body, 202, resp.body.decode())
         return resp
 
 
@@ -562,25 +638,28 @@ async def hibernate_workspace(request: Request, workspace_id: str):
     endpoint = "hibernate"
     body = await request.body()
 
-    if idempotency_key:
-        cached = idempotency_store.get(idempotency_key, endpoint, workspace_id, body)
-        if cached is not None:
-            status, cached_body = cached
-            return Response(content=cached_body, status_code=status, media_type="application/json")
-        if idempotency_store.check_conflict(idempotency_key, endpoint, workspace_id, body):
-            return JSONResponse(status_code=409, content=Error(error="Idempotency key conflict: different request body").model_dump())
-
     async with async_session_factory() as db:
+        # Authorize BEFORE consulting the idempotency cache (see start).
         ws = await _get_workspace_for_user(request, workspace_id, db)
         if ws is None:
             return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
 
-        if ws.state not in ("running", "idle_pending", "hibernating"):
-            return JSONResponse(status_code=409, content=Error(error=f"Cannot hibernate workspace in state '{ws.state}'").model_dump())
-
         # View access is not enough — hibernating mutates the workspace.
         if not await _can_operate_workspace(request, ws, db):
             return JSONResponse(status_code=403, content=Error(error="Insufficient permission").model_dump())
+
+        # Idempotency check (after authz; cache key is caller-scoped).
+        user_id = _get_user_id(request) or ""
+        if idempotency_key:
+            cached = idempotency_store.get(idempotency_key, endpoint, workspace_id, user_id, body)
+            if cached is not None:
+                status, cached_body = cached
+                return Response(content=cached_body, status_code=status, media_type="application/json")
+            if idempotency_store.check_conflict(idempotency_key, endpoint, workspace_id, user_id, body):
+                return JSONResponse(status_code=409, content=Error(error="Idempotency key conflict: different request body").model_dump())
+
+        if ws.state not in ("running", "idle_pending", "hibernating"):
+            return JSONResponse(status_code=409, content=Error(error=f"Cannot hibernate workspace in state '{ws.state}'").model_dump())
 
         operation_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
@@ -608,7 +687,7 @@ async def hibernate_workspace(request: Request, workspace_id: str):
         )
         resp = JSONResponse(status_code=202, content=result.model_dump(mode="json"))
         if idempotency_key:
-            idempotency_store.set(idempotency_key, endpoint, workspace_id, body, 202, resp.body.decode())
+            idempotency_store.set(idempotency_key, endpoint, workspace_id, user_id, body, 202, resp.body.decode())
         return resp
 
 
@@ -670,12 +749,7 @@ async def get_workspace_routing(request: Request, workspace_id: str):
         if user is None:
             return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
 
-        allowed = (
-            user.is_admin
-            or ws.user_id == user.user_id
-            or await _user_has_share(db, user.user_id, workspace_id, "operate")
-        )
-        if not allowed:
+        if not await _service_user_can_access(db, ws, user):
             return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
 
         # Dev mode (Docker Compose local stack): route to a fixed workspace
@@ -694,7 +768,51 @@ async def get_workspace_routing(request: Request, workspace_id: str):
             cluster_ip=cluster_ip,
             agent_ready=agent_ready,
             exposures=[],
+            agent_token=ws.agent_token or "",
         ).model_dump()
+
+
+@app.post("/api/internal/activity")
+async def record_workspace_activity(request: Request):
+    """Record end-user activity on a workspace (gateway-originated).
+
+    The gateway reports activity (throttled to >=60s per workspace) so the
+    control plane can extend idle-timeout windows. Same ACL as routing
+    (owner / admin / operate-share, via X-Service-User); anything else is a
+    404 so the endpoint never leaks whether a workspace exists.
+    """
+    body = await request.json()
+    workspace_id = body.get("workspace_id", "")
+    if not workspace_id:
+        return JSONResponse(status_code=422, content=Error(error="Missing workspace_id").model_dump())
+
+    service_user = request.headers.get("X-Service-User", "")
+    if not service_user:
+        return JSONResponse(status_code=401, content=Error(error="Missing X-Service-User").model_dump())
+
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(Workspace).where(Workspace.workspace_id == workspace_id)
+        )
+        ws = result.scalar_one_or_none()
+        if ws is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+
+        user_result = await db.execute(select(User).where(User.username == service_user))
+        user = user_result.scalar_one_or_none()
+        if user is None:
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+
+        if not await _service_user_can_access(db, ws, user):
+            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+
+        await db.execute(
+            update(Workspace)
+            .where(Workspace.workspace_id == workspace_id)
+            .values(last_activity_at=datetime.now(timezone.utc))
+        )
+        await db.commit()
+        return Response(status_code=204)
 
 
 @app.get("/api/internal/workspaces/{workspace_id}/mcp/{server_id}")
@@ -774,12 +892,11 @@ async def admin_delete_workspace(request: Request, workspace_id: str, preserve_p
         await db.execute(
             update(Workspace)
             .where(Workspace.workspace_id == workspace_id)
-            .values(state="deleting")
+            .values(state="deleting", preserve_pvc=preserve_pvc)
         )
 
-        if preserve_pvc:
-            # Store in metadata: the reconciler will skip PVC deletion
-            pass
+        # The reconciler reads ws.preserve_pvc to decide whether the PVC /
+        # namespace are torn down or kept for manual recovery.
 
         await record_audit_event(
             db, "admin.action",
@@ -1242,13 +1359,19 @@ async def get_workspace_secret(request: Request, workspace_id: str, key: str):
         secret = await db.get(WorkspaceSecret, {"workspace_id": workspace_id, "key": key})
         if secret is None:
             return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+        try:
+            value = decrypt_value(secret.value_encrypted)
+        except SecretDecryptionError:
+            return JSONResponse(
+                status_code=500,
+                content=Error(error="Failed to decrypt secret: encryption key rotated or lost").model_dump(),
+            )
         return SecretValueOut(
             workspace_id=workspace_id,
             key=key,
-            value=decrypt_value(secret.value_encrypted),
+            value=value,
             updated_at=secret.updated_at,
         ).model_dump()
-
 
 @app.put("/api/workspaces/{workspace_id}/secrets/{key}")
 async def upsert_workspace_secret(request: Request, workspace_id: str, key: str):
@@ -1476,35 +1599,45 @@ async def _get_quota(db: AsyncSession, user_id: str) -> Quota | None:
 
 @app.post("/api/internal/usage", status_code=201)
 async def ingest_usage(request: Request):
-    """Append usage events reported by workspace agents.
+    """Append usage events reported by workspace agents (pod-originated).
 
-    Token usage is enforced against the user's monthly quota: events are
+    The pod authenticates with its per-workspace token (X-Workspace-Token);
+    the caller's identity is the token's workspace OWNER. X-Service-User is
+    ignored here — it was the cross-tenant impersonation vector and is only
+    trusted from the gateway on other endpoints. Each event is recorded
+    against the bound workspace regardless of any client-supplied
+    ``workspace_id``.
+
+    Token usage is enforced against the owner's monthly quota: events are
     always recorded (full accounting), but the response is 429 once the
     month's total exceeds ``max_monthly_tokens`` so the agent backs off.
     """
-    service_user = request.headers.get("X-Service-User", "")
-    if not service_user:
-        return JSONResponse(status_code=401, content=Error(error="Missing X-Service-User").model_dump())
+    agent_token = request.headers.get("X-Workspace-Token", "")
+    if not agent_token:
+        return JSONResponse(status_code=401, content=Error(error="Missing X-Workspace-Token").model_dump())
 
     body = await request.json()
     data = UsageIngestRequest(**body)
     async with async_session_factory() as db:
-        user_result = await db.execute(select(User).where(User.username == service_user))
-        user = user_result.scalar_one_or_none()
+        ws_result = await db.execute(select(Workspace).where(Workspace.agent_token == agent_token))
+        workspace = ws_result.scalar_one_or_none()
+        if workspace is None:
+            return JSONResponse(status_code=403, content=Error(error="Invalid workspace token").model_dump())
+
+        user = await db.get(User, workspace.user_id)
         if user is None:
-            return JSONResponse(status_code=404, content=Error(error="Not found").model_dump())
+            return JSONResponse(status_code=403, content=Error(error="Invalid workspace token").model_dump())
 
         period = _current_period_start()
         token_delta = 0
         for ev in data.events:
             if ev.category not in USAGE_CATEGORIES:
                 return JSONResponse(status_code=400, content=Error(error=f"Unknown category '{ev.category}'").model_dump())
-            workspace_id = ev.workspace_id or f"ws-{user.username}"
             if ev.category == "tokens":
                 token_delta += ev.amount
             db.add(UsageEvent(
                 user_id=user.user_id,
-                workspace_id=workspace_id,
+                workspace_id=workspace.workspace_id,
                 category=ev.category,
                 metric=ev.metric,
                 amount=ev.amount,

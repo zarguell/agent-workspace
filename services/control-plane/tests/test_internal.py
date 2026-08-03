@@ -159,3 +159,105 @@ async def test_routing_dev_host_mode(client, service_token, monkeypatch):
     body = resp.json()
     assert body["cluster_ip"] == "10.9.9.9"
     assert body["agent_ready"] is True
+
+async def test_routing_includes_agent_token(client, service_token):
+    """The routing response carries the workspace agent token (default seed)."""
+    await seed_user("tok-route")
+    await _login(client, "tok-route")
+
+    resp = await client.get(
+        "/api/internal/workspaces/ws-tok-route/routing",
+        headers={"X-Service-Auth": service_token, "X-Service-User": "tok-route"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["agent_token"] == "tok-tok-route"
+
+
+async def test_routing_agent_token_custom(client, service_token):
+    """seed_user's agent_token param is what routing returns."""
+    await seed_user("tok-custom", agent_token="custom-secret-123")
+    await _login(client, "tok-custom")
+
+    resp = await client.get(
+        "/api/internal/workspaces/ws-tok-custom/routing",
+        headers={"X-Service-Auth": service_token, "X-Service-User": "tok-custom"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["agent_token"] == "custom-secret-123"
+
+
+async def test_routing_agent_token_empty_for_legacy_workspace(client, service_token, db):
+    """Workspaces whose agent_token is NULL (pre-column, never reconciled)
+    get an empty string so the gateway refuses pod calls instead of
+    sending an unauthenticated request."""
+    from sqlalchemy import update
+    from models import Workspace
+
+    await seed_user("tok-legacy")
+    await _login(client, "tok-legacy")
+    await db.execute(
+        update(Workspace).where(Workspace.workspace_id == "ws-tok-legacy").values(agent_token=None)
+    )
+    await db.commit()
+
+    resp = await client.get(
+        "/api/internal/workspaces/ws-tok-legacy/routing",
+        headers={"X-Service-Auth": service_token, "X-Service-User": "tok-legacy"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["agent_token"] == ""
+
+async def test_activity_requires_service_auth(client):
+    resp = await client.post("/api/internal/activity", json={"workspace_id": "ws-activity-owner"})
+    assert resp.status_code == 403
+
+
+async def test_activity_requires_service_user(client, service_token):
+    resp = await client.post(
+        "/api/internal/activity",
+        headers={"X-Service-Auth": service_token},
+        json={"workspace_id": "ws-activity-owner"},
+    )
+    assert resp.status_code == 401
+
+
+async def test_activity_owner_updates_last_activity(client, service_token, db):
+    await seed_user("activity-owner")
+    from sqlalchemy import update
+    from models import Workspace
+    await db.execute(
+        update(Workspace).where(Workspace.workspace_id == "ws-activity-owner").values(last_activity_at=None)
+    )
+    await db.commit()
+
+    resp = await client.post(
+        "/api/internal/activity",
+        headers={"X-Service-Auth": service_token, "X-Service-User": "activity-owner"},
+        json={"workspace_id": "ws-activity-owner"},
+    )
+    assert resp.status_code == 204
+
+    ws = await db.get(Workspace, "ws-activity-owner")
+    await db.refresh(ws)
+    assert ws.last_activity_at is not None
+
+
+async def test_activity_unknown_workspace(client, service_token):
+    await seed_user("activity-owner")
+    resp = await client.post(
+        "/api/internal/activity",
+        headers={"X-Service-Auth": service_token, "X-Service-User": "activity-owner"},
+        json={"workspace_id": "ws-does-not-exist"},
+    )
+    assert resp.status_code == 404
+
+
+async def test_activity_stranger_denied(client, service_token):
+    await seed_user("activity-owner")
+    await seed_user("activity-stranger")
+    resp = await client.post(
+        "/api/internal/activity",
+        headers={"X-Service-Auth": service_token, "X-Service-User": "activity-stranger"},
+        json={"workspace_id": "ws-activity-owner"},
+    )
+    assert resp.status_code == 404

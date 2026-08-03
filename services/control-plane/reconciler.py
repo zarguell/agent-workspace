@@ -22,21 +22,40 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from audit import record_audit_event
 from database import async_session_factory
 from models import User, Workspace, WorkspaceSecret
-from secrets_store import decrypt_value
+from secrets_store import decrypt_value, decrypt_value_if_encrypted, encrypt_if_stable
 
 logger = logging.getLogger("control-plane.reconciler")
 
 RECONCILE_INTERVAL = 30  # seconds
 IDLE_GRACE_SECONDS = 30  # grace period from idle_pending → hibernating
+def _env_int(name: str, default: int) -> int:
+    """Read an int env var, falling back to the default on garbage/missing."""
+    try:
+        return int(os.environ.get(name, ""))
+    except (TypeError, ValueError):
+        return default
+
+
+# A workspace stuck in "starting" past this is failed (restartable).
+START_TIMEOUT_MINUTES = _env_int("START_TIMEOUT_MINUTES", 10)
+# Namespace deletion is polled to completion; past this we log loudly and
+# keep retrying (never claim "deleted" while the namespace still exists).
+DELETE_TIMEOUT_MINUTES = _env_int("DELETE_TIMEOUT_MINUTES", 5)
 WORKSPACE_IMAGE = os.environ.get(
     "WORKSPACE_IMAGE",
     "localhost:5000/agent-workspace:dev-latest",
 )
-SERVICE_AUTH_TOKEN = os.environ.get("SERVICE_AUTH_TOKEN", "internal-service-token")
+CONTROL_PLANE_URL = os.environ.get(
+    "CONTROL_PLANE_URL",
+    # Workspace pods live in per-user namespaces; use the namespace-qualified
+    # control-plane service DNS so usage reporting doesn't NXDOMAIN.
+    "http://control-plane.agent-platform.svc.cluster.local:80",
+)
 
 def _new_canvas_key() -> str:
-    """Generate a per-workspace Canvas credential."""
-    return secrets.token_hex(32)
+    """Generate a per-workspace Canvas credential in its at-rest form
+    (Fernet-encrypted when SECRETS_MASTER_KEY is stable)."""
+    return encrypt_if_stable(secrets.token_hex(32))
 
 # K8s resource name helpers
 def _ns_name(user_id: str) -> str:
@@ -72,6 +91,9 @@ class Reconciler:
         self._k8s_core: Optional[client.CoreV1Api] = None
         self._k8s_net: Optional[client.NetworkingV1Api] = None
         self._initialized = False
+        # user_id → when its namespace deletion was first requested; used to
+        # detect namespaces stuck in Terminating past DELETE_TIMEOUT_MINUTES.
+        self._ns_delete_started: dict = {}
 
     def _init_k8s(self):
         if self._initialized:
@@ -87,11 +109,26 @@ class Reconciler:
 
     # ─── Namespace ──────────────────────────────────────────────────────
 
-    def _ensure_namespace(self, user_id: str):
+    def _ensure_namespace(self, user_id: str) -> bool:
+        """Ensure the workspace namespace exists and is usable.
+
+        Returns True when the namespace is present (or was just created);
+        False when it exists but is phase=Terminating — callers must NOT
+        create resources into a dying namespace and should retry next pass.
+        """
         ns = _ns_name(user_id)
         try:
-            self._k8s_core.read_namespace(ns)
+            obj = self._k8s_core.read_namespace(ns)
+            status = getattr(obj, "status", None)
+            phase = getattr(status, "phase", None) if status is not None else None
+            if phase == "Terminating":
+                logger.warning(
+                    "Namespace %s is Terminating — skipping resource creation for %s (retry next pass)",
+                    ns, user_id,
+                )
+                return False
             logger.debug("Namespace %s exists", ns)
+            return True
         except ApiException as e:
             if e.status != 404:
                 raise
@@ -100,6 +137,7 @@ class Reconciler:
             )
             self._k8s_core.create_namespace(body)
             logger.info("Created namespace %s", ns)
+            return True
 
     def _delete_namespace(self, user_id: str):
         ns = _ns_name(user_id)
@@ -194,6 +232,7 @@ class Reconciler:
         replicas: int = 1,
         canvas_api_key: str = "",
         canvas_secret_key: str = "",
+        agent_token: str = "",
         extra_env: Optional[list] = None,
     ):
         ns = _ns_name(user_id)
@@ -237,7 +276,10 @@ class Reconciler:
                         # Pin Canvas credentials so reconnect survives pod recreate
                         client.V1EnvVar(name="LOCAL_BACKEND_API_KEY", value=canvas_api_key),
                         client.V1EnvVar(name="OH_SECRET_KEY", value=canvas_secret_key),
-                        client.V1EnvVar(name="SERVICE_AUTH_TOKEN", value=SERVICE_AUTH_TOKEN),
+                        # Per-workspace agent token — the ONLY credential the
+                        # pod may present to the control plane (X-Workspace-Token).
+                        client.V1EnvVar(name="WORKSPACE_AGENT_TOKEN", value=agent_token),
+                        client.V1EnvVar(name="CONTROL_PLANE_URL", value=CONTROL_PLANE_URL),
                     ] + (extra_env or []),
                     resources=client.V1ResourceRequirements(
                         requests={"cpu": "512m", "memory": "1Gi"},
@@ -272,18 +314,21 @@ class Reconciler:
         logger.info("Created Deployment %s in %s (replicas=%d)", name, ns, replicas)
 
     def _scale_deployment(self, user_id: str, replicas: int):
-        """Scale an existing deployment's replicas."""
+        """Scale an existing deployment's replicas.
+
+        ApiException(404) is NOT swallowed: a missing deployment means the
+        workspace's Deployment was deleted out from under it — callers
+        recreate it instead of leaving the workspace permanently bricked.
+        """
         ns = _ns_name(user_id)
         name = _deploy_name(user_id)
-        try:
-            body = {"spec": {"replicas": replicas}}
-            self._k8s_apps.patch_namespaced_deployment(name, ns, body)
-            logger.info("Scaled Deployment %s in %s to %d (patch)", name, ns, replicas)
-        except ApiException as e:
-            if e.status == 404:
-                logger.warning("Deployment %s not found for scaling", name)
-                return
-            raise
+        body = {"spec": {"replicas": replicas}}
+        # Detect a deleted Deployment deterministically (patch alone may
+        # 404 in real K8s but not in all clients); 404 propagates to the
+        # caller, which recreates the Deployment (H4 recovery).
+        self._k8s_apps.read_namespaced_deployment(name, ns)
+        self._k8s_apps.patch_namespaced_deployment(name, ns, body)
+        logger.info("Scaled Deployment %s in %s to %d (patch)", name, ns, replicas)
 
     def _delete_deployment(self, user_id: str):
         ns = _ns_name(user_id)
@@ -300,6 +345,33 @@ class Reconciler:
         name = _svc_name(user_id)
         try:
             self._k8s_core.delete_namespaced_service(name, ns)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+    def _delete_network_policy(self, user_id: str):
+        ns = _ns_name(user_id)
+        name = "default-deny-ingress"
+        try:
+            self._k8s_net.delete_namespaced_network_policy(name, ns)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+    def _delete_resource_quota(self, user_id: str):
+        ns = _ns_name(user_id)
+        name = f"quota-{_ns_name(user_id)}"
+        try:
+            self._k8s_core.delete_namespaced_resource_quota(name, ns)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+    def _delete_service_account(self, user_id: str):
+        ns = _ns_name(user_id)
+        name = "workspace"
+        try:
+            self._k8s_core.delete_namespaced_service_account(name, ns)
         except ApiException as e:
             if e.status != 404:
                 raise
@@ -360,6 +432,11 @@ class Reconciler:
 
     def _build_network_policy(self, name: str, mode: str, allowlist: Optional[list]) -> client.V1NetworkPolicy:
         """Build the desired NetworkPolicy for an egress mode."""
+        # Ingress is locked to the gateway (full proxy surface: canvas
+        # :8000, code-server :8080, paseo :6767, agent :9000) plus the
+        # control-plane's readiness probe (:9000 only). Everything else in
+        # the platform namespace is denied — because policy_types includes
+        # Ingress, any peer without a matching rule is dropped.
         ingress = [
             client.V1NetworkPolicyIngressRule(
                 _from=[
@@ -367,9 +444,25 @@ class Reconciler:
                         namespace_selector=client.V1LabelSelector(
                             match_labels={"kubernetes.io/metadata.name": "agent-platform"},
                         ),
+                        pod_selector=client.V1LabelSelector(
+                            match_labels={"app.kubernetes.io/name": "gateway"},
+                        ),
                     ),
                 ],
-            )
+            ),
+            client.V1NetworkPolicyIngressRule(
+                ports=[client.V1NetworkPolicyPort(port=9000, protocol="TCP")],
+                _from=[
+                    client.V1NetworkPolicyPeer(
+                        namespace_selector=client.V1LabelSelector(
+                            match_labels={"kubernetes.io/metadata.name": "agent-platform"},
+                        ),
+                        pod_selector=client.V1LabelSelector(
+                            match_labels={"app.kubernetes.io/name": "control-plane"},
+                        ),
+                    ),
+                ],
+            ),
         ]
         egress = None
         policy_types = ["Ingress"]
@@ -441,7 +534,7 @@ class Reconciler:
         url = f"http://{host}:9000/ready"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(url, headers={"X-Service-Auth": SERVICE_AUTH_TOKEN})
+                resp = await client.get(url)
                 if resp.status_code == 200:
                     data = resp.json()
                     return data.get("status") == "ready"
@@ -473,6 +566,95 @@ class Reconciler:
 
     # ─── State machine transitions ──────────────────────────────────────
 
+    async def _ensure_agent_token(self, ws: Workspace) -> str:
+        """Return the workspace's agent token, generating and persisting it
+        when missing (rows created before the column existed). Persisted
+        BEFORE the Deployment is created so a crash between persist and
+        deploy doesn't lose the token."""
+        token = ws.agent_token
+        if not token:
+            token = secrets.token_urlsafe(32)
+            async with async_session_factory() as db:
+                await db.execute(
+                    update(Workspace)
+                    .where(Workspace.workspace_id == ws.workspace_id)
+                    .values(agent_token=token)
+                )
+                await db.commit()
+            logger.info("Generated and persisted agent token for workspace %s", ws.workspace_id)
+        return token
+
+    async def _build_workspace_env(self, ws: Workspace) -> list:
+        """Workspace identity + secrets → env vars (the agent sources
+        WS_SECRET_* from these; identity is derived server-side from the
+        agent token now)."""
+        secret_env: list = []
+        username = ""
+        async with async_session_factory() as db:
+            user_result = await db.execute(select(User).where(User.user_id == ws.user_id))
+            user = user_result.scalar_one_or_none()
+            if user:
+                username = user.username
+            result = await db.execute(
+                select(WorkspaceSecret).where(WorkspaceSecret.workspace_id == ws.workspace_id)
+            )
+            for s in result.scalars().all():
+                secret_env.append(client.V1EnvVar(
+                    name=f"WS_SECRET_{s.key.upper()}",
+                    value=decrypt_value(s.value_encrypted),
+                ))
+        return [
+            client.V1EnvVar(name="WORKSPACE_ID", value=ws.workspace_id),
+            client.V1EnvVar(name="USERNAME", value=username),
+        ] + secret_env
+
+    async def _ensure_workspace_pod(self, ws: Workspace, user_id: str):
+        """Create the workspace Deployment (idempotent) with persisted
+        credentials. Used by the starting state, and to RECREATE a
+        Deployment that vanished while the workspace was running or
+        hibernating (H4 recovery)."""
+        if not self._ensure_namespace(user_id):
+            # Namespace is dying (Terminating): creating resources into it
+            # would hot-loop on ApiException. Retry next pass instead.
+            logger.warning(
+                "Skipping resource creation for workspace %s: namespace %s not usable",
+                ws.workspace_id, _ns_name(user_id),
+            )
+            return
+        self._ensure_service_account(user_id)
+        self._ensure_pvc(user_id)
+        self._ensure_service(user_id)
+        self._ensure_resource_quota(user_id)
+        # Canvas credentials are stored at rest — Fernet-encrypted when
+        # SECRETS_MASTER_KEY is stable, legacy plaintext for pre-encryption
+        # rows. Persist the at-rest form unchanged; decrypt only at the
+        # pod-env boundary so a ciphertext is never injected as a key.
+        stored_api_key = ws.canvas_api_key or _new_canvas_key()
+        stored_secret_key = ws.canvas_secret_key or _new_canvas_key()
+        if not ws.canvas_api_key or not ws.canvas_secret_key:
+            # Persist generated keys so they survive future pod recreates
+            async with async_session_factory() as db:
+                await db.execute(
+                    update(Workspace)
+                    .where(Workspace.workspace_id == ws.workspace_id)
+                    .values(
+                        canvas_api_key=stored_api_key,
+                        canvas_secret_key=stored_secret_key,
+                    )
+                )
+                await db.commit()
+            logger.info("Persisted Canvas keys for workspace %s", ws.workspace_id)
+        agent_token = await self._ensure_agent_token(ws)
+        self._ensure_deployment(
+            user_id,
+            ws.image or WORKSPACE_IMAGE,
+            canvas_api_key=decrypt_value_if_encrypted(stored_api_key),
+            canvas_secret_key=decrypt_value_if_encrypted(stored_secret_key),
+            agent_token=agent_token,
+            extra_env=await self._build_workspace_env(ws),
+        )
+
+
     async def _reconcile_workspace(self, ws: Workspace):
         """Reconcile a single workspace based on its state."""
         user_id = ws.user_id
@@ -485,64 +667,32 @@ class Reconciler:
                 await db.execute(
                     update(Workspace)
                     .where(Workspace.workspace_id == ws.workspace_id)
-                    .values(state="starting", image=ws.image)
+                    .values(state="starting", image=ws.image, started_at=datetime.now(timezone.utc))
                 )
                 await db.commit()
             logger.info("Workspace %s transitioning requested -> starting", ws.workspace_id)
-
         if ws.state == "starting":
-            self._init_k8s()
-            try:
-                self._ensure_namespace(user_id)
-                self._ensure_service_account(user_id)
-                self._ensure_pvc(user_id)
-                self._ensure_service(user_id)
-                self._ensure_resource_quota(user_id)
-                self._ensure_network_policy(user_id, mode=ws.network_mode, allowlist=ws.egress_allowlist)
-                canvas_api_key = ws.canvas_api_key or _new_canvas_key()
-                canvas_secret_key = ws.canvas_secret_key or _new_canvas_key()
-                if not ws.canvas_api_key or not ws.canvas_secret_key:
-                    # Persist generated keys so they survive future pod recreates
+            # Start deadline: a workspace stuck in starting past
+            # START_TIMEOUT_MINUTES is failed (restartable via /start). A
+            # missing started_at is treated as fresh (nothing to time out).
+            if ws.started_at:
+                started_seconds = (datetime.now(timezone.utc) - ws.started_at).total_seconds()
+                if started_seconds > START_TIMEOUT_MINUTES * 60:
                     async with async_session_factory() as db:
                         await db.execute(
                             update(Workspace)
                             .where(Workspace.workspace_id == ws.workspace_id)
-                            .values(
-                                canvas_api_key=canvas_api_key,
-                                canvas_secret_key=canvas_secret_key,
-                            )
+                            .values(state="failed")
                         )
                         await db.commit()
-                    logger.info("Persisted Canvas keys for workspace %s", ws.workspace_id)
-                # Workspace identity + secrets → env vars (the agent uses
-                # these to report usage and to source WS_SECRET_* values).
-                secret_env: list = []
-                username = ""
-                async with async_session_factory() as db:
-                    user_result = await db.execute(select(User).where(User.user_id == ws.user_id))
-                    user = user_result.scalar_one_or_none()
-                    if user:
-                        username = user.username
-                    result = await db.execute(
-                        select(WorkspaceSecret).where(WorkspaceSecret.workspace_id == ws.workspace_id)
+                    logger.error(
+                        "Workspace %s failed: stuck in starting for %.0fs (limit %d min)",
+                        ws.workspace_id, started_seconds, START_TIMEOUT_MINUTES,
                     )
-                    for s in result.scalars().all():
-                        secret_env.append(client.V1EnvVar(
-                            name=f"WS_SECRET_{s.key.upper()}",
-                            value=decrypt_value(s.value_encrypted),
-                        ))
-                extra_env = [
-                    client.V1EnvVar(name="WORKSPACE_ID", value=ws.workspace_id),
-                    client.V1EnvVar(name="USERNAME", value=username),
-                ] + secret_env
-                self._ensure_deployment(
-                    user_id,
-                    ws.image or WORKSPACE_IMAGE,
-                    replicas=1,
-                    canvas_api_key=canvas_api_key,
-                    canvas_secret_key=canvas_secret_key,
-                    extra_env=extra_env,
-                )
+                    return
+            self._init_k8s()
+            try:
+                await self._ensure_workspace_pod(ws, user_id)
             except Exception as e:
                 logger.error("Failed to create K8s resources for workspace %s: %s", ws.workspace_id, e)
                 return  # Will be retried on next poll
@@ -608,16 +758,40 @@ class Reconciler:
                                 .values(state="hibernated")
                             )
                             await db.commit()
-                except ApiException:
-                    pass
+                except ApiException as e:
+                    if e.status == 404:
+                        # Deployment was deleted out from under the running
+                        # workspace — recreate it so it recovers instead of
+                        # bricking in "running" forever (H4).
+                        logger.warning("Deployment %s missing for workspace %s; recreating", name, ws.workspace_id)
+                        try:
+                            await self._ensure_workspace_pod(ws, user_id)
+                        except Exception as e2:
+                            logger.error("Failed to recreate Deployment for %s: %s", ws.workspace_id, e2)
+                    else:
+                        logger.warning("Deployment read failed for %s: %s", ws.workspace_id, e)
 
         elif ws.state == "idle_pending":
-            # Check if grace period elapsed
+            # Two exits from the grace window: fresh activity cancels the
+            # pending hibernation (back to running); the grace period
+            # elapsing moves it to hibernating.
             if ws.last_activity_at:
                 now = datetime.now(timezone.utc)
                 idle_seconds = (now - ws.last_activity_at).total_seconds()
-                idle_threshold = (ws.idle_timeout_minutes * 60) + IDLE_GRACE_SECONDS
-                if idle_seconds > idle_threshold:
+                idle_timeout = ws.idle_timeout_minutes * 60
+                idle_threshold = idle_timeout + IDLE_GRACE_SECONDS
+                if idle_seconds < idle_timeout:
+                    # Activity renewed during idle_pending (e.g. a fresh
+                    # activity POST) — cancel the pending hibernate.
+                    async with async_session_factory() as db:
+                        await db.execute(
+                            update(Workspace)
+                            .where(Workspace.workspace_id == ws.workspace_id)
+                            .values(state="running")
+                        )
+                        await db.commit()
+                    logger.info("Workspace %s back to running (fresh activity during idle_pending)", ws.workspace_id)
+                elif idle_seconds > idle_threshold:
                     async with async_session_factory() as db:
                         await db.execute(
                             update(Workspace)
@@ -631,6 +805,21 @@ class Reconciler:
             self._init_k8s()
             try:
                 self._scale_deployment(user_id, 0)
+            except ApiException as e:
+                if e.status == 404:
+                    # Deployment was deleted out from under the workspace —
+                    # recreate it so hibernation stays reversible, then scale
+                    # down (H4).
+                    logger.warning("Deployment for %s missing during hibernate; recreating", user_id)
+                    try:
+                        await self._ensure_workspace_pod(ws, user_id)
+                        self._scale_deployment(user_id, 0)
+                    except Exception as e2:
+                        logger.error("Failed to recreate Deployment for %s: %s", ws.workspace_id, e2)
+                        return
+                else:
+                    logger.error("Failed to scale down workspace %s: %s", ws.workspace_id, e)
+                    return
             except Exception as e:
                 logger.error("Failed to scale down workspace %s: %s", ws.workspace_id, e)
                 return
@@ -651,10 +840,90 @@ class Reconciler:
 
         elif ws.state == "deleting":
             self._init_k8s()
+            # Plumbed by the admin delete handler (preserve_pvc query flag);
+            # read defensively so the reconciler tolerates rows without the
+            # attribute/column.
+            preserve_pvc = bool(getattr(ws, "preserve_pvc", False))
+            if preserve_pvc:
+                # Keep the namespace and PVC (data intact, restartable);
+                # remove only pod-facing resources.
+                try:
+                    self._delete_deployment(user_id)
+                    self._delete_service(user_id)
+                    self._delete_network_policy(user_id)
+                    self._delete_resource_quota(user_id)
+                    self._delete_service_account(user_id)
+                except Exception as e:
+                    logger.error("Failed to delete pod-facing resources for %s: %s", ws.workspace_id, e)
+                    async with async_session_factory() as db:
+                        await db.execute(
+                            update(Workspace)
+                            .where(Workspace.workspace_id == ws.workspace_id)
+                            .values(state="failed")
+                        )
+                        await db.commit()
+                    return
+                async with async_session_factory() as db:
+                    await db.execute(
+                        update(Workspace)
+                        .where(Workspace.workspace_id == ws.workspace_id)
+                        .values(state="hibernated")
+                    )
+                    await db.commit()
+                    await record_audit_event(
+                        db, "workspace.hibernated",
+                        actor_user_id=user_id,
+                        workspace_id=ws.workspace_id,
+                    )
+                    await db.commit()
+                logger.info("Workspace %s hibernated (PVC preserved)", ws.workspace_id)
+                return
+
+            # Full teardown: delete pod-facing resources and the namespace,
+            # but never claim "deleted" until the namespace actually reads
+            # 404 (a Terminating namespace still exists).
             try:
                 self._delete_deployment(user_id)
                 self._delete_service(user_id)
                 self._delete_namespace(user_id)
+                if user_id not in self._ns_delete_started:
+                    self._ns_delete_started[user_id] = datetime.now(timezone.utc)
+                    logger.info("Workspace %s: namespace deletion requested", ws.workspace_id)
+                try:
+                    self._k8s_core.read_namespace(_ns_name(user_id))
+                except ApiException as e:
+                    if e.status != 404:
+                        raise
+                    # Namespace is gone — deletion complete.
+                    self._ns_delete_started.pop(user_id, None)
+                    async with async_session_factory() as db:
+                        await db.execute(
+                            update(Workspace)
+                            .where(Workspace.workspace_id == ws.workspace_id)
+                            .values(state="deleted")
+                        )
+                        await db.commit()
+                        await record_audit_event(
+                            db, "workspace.deleted",
+                            actor_user_id=user_id,
+                            workspace_id=ws.workspace_id,
+                        )
+                        await db.commit()
+                    logger.info("Workspace %s deleted", ws.workspace_id)
+                    return
+                # Namespace still exists (likely Terminating): keep polling.
+                elapsed = (datetime.now(timezone.utc) - self._ns_delete_started[user_id]).total_seconds()
+                if elapsed > DELETE_TIMEOUT_MINUTES * 60:
+                    logger.error(
+                        "Workspace %s: namespace %s still exists %.0fs after deletion request — "
+                        "stuck Terminating? Keeping state=deleting and retrying next pass",
+                        ws.workspace_id, _ns_name(user_id), elapsed,
+                    )
+                else:
+                    logger.info(
+                        "Workspace %s: namespace %s still terminating, retrying next pass",
+                        ws.workspace_id, _ns_name(user_id),
+                    )
             except Exception as e:
                 logger.error("Failed to delete K8s resources for %s: %s", ws.workspace_id, e)
                 async with async_session_factory() as db:
@@ -665,20 +934,6 @@ class Reconciler:
                     )
                     await db.commit()
                 return
-            async with async_session_factory() as db:
-                await db.execute(
-                    update(Workspace)
-                    .where(Workspace.workspace_id == ws.workspace_id)
-                    .values(state="deleted")
-                )
-                await db.commit()
-                await record_audit_event(
-                    db, "workspace.deleted",
-                    actor_user_id=user_id,
-                    workspace_id=ws.workspace_id,
-                )
-                await db.commit()
-            logger.info("Workspace %s deleted", ws.workspace_id)
 
     # ─── Main loop ──────────────────────────────────────────────────────
 

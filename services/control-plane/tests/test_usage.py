@@ -1,5 +1,9 @@
 """Usage ledger ingestion, quota enforcement, and summary endpoints.
 
+Ingestion is pod-originated: the caller authenticates with the workspace's
+per-workspace token (X-Workspace-Token) and identity is derived from the
+token's workspace owner. X-Service-User is not accepted on this endpoint.
+
 All tests use dedicated usernames: alice/bob carry admin flags and grants
 set by other test files, which would corrupt admin-gated assertions.
 """
@@ -11,48 +15,56 @@ async def _login(client, username, password="pw"):
     return await client.post("/api/login", json={"username": username, "password": password})
 
 
-async def _ingest(client, token, username, events):
+async def _ingest(client, username, events, extra_headers=None):
+    headers = {"X-Workspace-Token": f"tok-{username}"}
+    if extra_headers:
+        headers.update(extra_headers)
     return await client.post(
         "/api/internal/usage",
-        headers={"X-Service-Auth": token, "X-Service-User": username},
+        headers=headers,
         json={"events": events},
     )
 
 
-async def test_ingest_requires_service_auth(client):
-    resp = await client.post("/api/internal/usage", json={"events": []})
-    assert resp.status_code == 403
-
-
-async def test_ingest_requires_service_user(client, service_token):
+async def test_ingest_does_not_require_service_auth(client):
+    """Usage is pod-originated: the shared X-Service-Auth secret is not used."""
+    await seed_user("ua-nosvc")
     resp = await client.post(
         "/api/internal/usage",
-        headers={"X-Service-Auth": service_token},
+        headers={"X-Workspace-Token": "tok-ua-nosvc"},
+        json={"events": [{"category": "tokens", "metric": "t", "amount": 1, "unit": "tokens"}]},
+    )
+    assert resp.status_code == 201
+
+
+async def test_ingest_requires_workspace_token(client):
+    resp = await client.post(
+        "/api/internal/usage",
         json={"events": [{"category": "tokens", "metric": "t", "amount": 1, "unit": "tokens"}]},
     )
     assert resp.status_code == 401
 
 
-async def test_ingest_unknown_user(client, service_token):
-    resp = await _ingest(client, service_token, "ghost", [
+async def test_ingest_unknown_token(client):
+    resp = await _ingest(client, "ua-ghost", [
         {"category": "tokens", "metric": "t", "amount": 1, "unit": "tokens"},
     ])
-    assert resp.status_code == 404
+    assert resp.status_code == 403
 
 
-async def test_ingest_unknown_category(client, service_token):
-    await seed_user("u-cat")
-    resp = await _ingest(client, service_token, "u-cat", [
+async def test_ingest_unknown_category(client):
+    await seed_user("ua-cat")
+    resp = await _ingest(client, "ua-cat", [
         {"category": "bananas", "metric": "t", "amount": 1, "unit": "tokens"},
     ])
     assert resp.status_code == 400
 
 
-async def test_ingest_records_and_summarizes(client, service_token):
-    await seed_user("u-rec")
-    await _login(client, "u-rec")
+async def test_ingest_records_and_summarizes(client):
+    await seed_user("ua-rec")
+    await _login(client, "ua-rec")
 
-    resp = await _ingest(client, service_token, "u-rec", [
+    resp = await _ingest(client, "ua-rec", [
         {"category": "tokens", "metric": "claude_code_tokens", "amount": 1200, "unit": "tokens"},
         {"category": "compute", "metric": "cpu_seconds", "amount": 3600, "unit": "s"},
     ])
@@ -68,11 +80,52 @@ async def test_ingest_records_and_summarizes(client, service_token):
     assert body["quota_exceeded"] is False
 
 
-async def test_quota_exceeded_returns_429(client, service_token):
-    await seed_user("uq-user")
-    await seed_user("uq-admin", is_admin=True)
-    user = await seed_user("uq-user")
-    await _login(client, "uq-admin")
+async def test_ingest_spoofed_service_user_ignored(client):
+    """Identity comes from the token's workspace owner; X-Service-User is ignored."""
+    owner = await seed_user("ua-owner")
+    spoof = await seed_user("ua-spoof")
+    await _login(client, "ua-owner")
+
+    resp = await _ingest(
+        client, "ua-owner",
+        [{"category": "tokens", "metric": "t", "amount": 500, "unit": "tokens"}],
+        extra_headers={"X-Service-User": "ua-spoof"},
+    )
+    assert resp.status_code == 201
+
+    # Events land under the token owner, not the spoofed user.
+    summary = await client.get("/api/usage/summary")
+    assert summary.json()["totals"]["tokens"] == 500
+
+    await seed_user("ua-admin", is_admin=True)
+    await _login(client, "ua-admin")
+    spoofed = await client.get(f"/api/admin/usage?user_id={spoof.user_id}")
+    assert spoofed.json()["total"] == 0
+    owned = await client.get(f"/api/admin/usage?user_id={owner.user_id}")
+    assert owned.json()["total"] == 1
+    assert owned.json()["events"][0]["workspace_id"] == "ws-ua-owner"
+
+
+async def test_ingest_forces_bound_workspace(client):
+    """Client-supplied workspace_id in the event body is ignored."""
+    owner = await seed_user("ua-bind")
+    await seed_user("ua-bind-admin", is_admin=True)
+    await _login(client, "ua-bind-admin")
+
+    resp = await _ingest(client, "ua-bind", [
+        {"category": "tokens", "metric": "t", "amount": 250, "unit": "tokens", "workspace_id": "ws-someone-elses"},
+    ])
+    assert resp.status_code == 201
+
+    page = await client.get(f"/api/admin/usage?user_id={owner.user_id}")
+    assert page.json()["total"] == 1
+    assert page.json()["events"][0]["workspace_id"] == "ws-ua-bind"
+
+
+async def test_quota_exceeded_returns_429(client):
+    user = await seed_user("ua-quota")
+    await seed_user("ua-quota-admin", is_admin=True)
+    await _login(client, "ua-quota-admin")
 
     set_q = await client.put(
         f"/api/admin/quotas/{user.user_id}",
@@ -80,20 +133,20 @@ async def test_quota_exceeded_returns_429(client, service_token):
     )
     assert set_q.status_code == 200
 
-    first = await _ingest(client, service_token, "uq-user", [
+    first = await _ingest(client, "ua-quota", [
         {"category": "tokens", "metric": "t", "amount": 60, "unit": "tokens"},
     ])
     assert first.status_code == 201
     assert first.json()["quota_exceeded"] is False
 
-    second = await _ingest(client, service_token, "uq-user", [
+    second = await _ingest(client, "ua-quota", [
         {"category": "tokens", "metric": "t", "amount": 60, "unit": "tokens"},
     ])
     assert second.status_code == 429
     assert second.json()["quota_exceeded"] is True
 
     # Events are still recorded for full accounting; the summary flags it.
-    await _login(client, "uq-user")
+    await _login(client, "ua-quota")
     summary = await client.get("/api/usage/summary")
     body = summary.json()
     assert body["totals"]["tokens"] == 120
@@ -107,20 +160,20 @@ async def test_summary_requires_session(client):
     assert resp.status_code == 401
 
 
-async def test_admin_usage_filtered(client, service_token):
-    await seed_user("uf-user")
-    await seed_user("uf-admin", is_admin=True)
-    await _login(client, "uf-user")
-    await _ingest(client, service_token, "uf-user", [
-        {"category": "tokens", "metric": "t", "amount": 500, "unit": "tokens", "workspace_id": "ws-uf-user"},
+async def test_admin_usage_filtered(client):
+    await seed_user("ua-uf")
+    await seed_user("ua-uf-admin", is_admin=True)
+    await _login(client, "ua-uf")
+    await _ingest(client, "ua-uf", [
+        {"category": "tokens", "metric": "t", "amount": 500, "unit": "tokens"},
     ])
 
     # Non-admin cannot list usage.
     denied = await client.get("/api/admin/usage")
     assert denied.status_code == 403
 
-    await _login(client, "uf-admin")
-    page = await client.get("/api/admin/usage?workspace_id=ws-uf-user")
+    await _login(client, "ua-uf-admin")
+    page = await client.get("/api/admin/usage?workspace_id=ws-ua-uf")
     assert page.json()["total"] == 1
     assert page.json()["events"][0]["amount"] == 500
 
@@ -129,15 +182,15 @@ async def test_admin_usage_filtered(client, service_token):
 
 
 async def test_admin_quota_crud(client):
-    user = await seed_user("qc-user")
-    await seed_user("qc-admin", is_admin=True)
-    await _login(client, "qc-user")
+    user = await seed_user("ua-qc")
+    await seed_user("ua-qc-admin", is_admin=True)
+    await _login(client, "ua-qc")
 
     # Non-admin cannot touch quotas.
     denied = await client.get(f"/api/admin/quotas/{user.user_id}")
     assert denied.status_code == 403
 
-    await _login(client, "qc-admin")
+    await _login(client, "ua-qc-admin")
     created = await client.put(
         f"/api/admin/quotas/{user.user_id}",
         json={"max_monthly_tokens": 10000, "max_storage_gb": 20},

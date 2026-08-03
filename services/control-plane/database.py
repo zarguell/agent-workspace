@@ -41,12 +41,16 @@ async def init_db():
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Columns added in later versions — no-op on fresh installs
+        # Columns added in later versions — no-op on fresh installs. The
+        # canvas-key columns were widened to VARCHAR(255) to fit Fernet
+        # tokens (~120 chars); ALTER COLUMN TYPE is idempotent.
         for stmt in [
-            "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS canvas_api_key VARCHAR(64)",
-            "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS canvas_secret_key VARCHAR(64)",
+            "ALTER TABLE workspaces ALTER COLUMN canvas_api_key TYPE VARCHAR(255)",
+            "ALTER TABLE workspaces ALTER COLUMN canvas_secret_key TYPE VARCHAR(255)",
             "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS network_mode VARCHAR(20) DEFAULT 'open'",
             "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS egress_allowlist JSONB DEFAULT '[]'::jsonb",
+            "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS agent_token VARCHAR(64)",
+            "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS preserve_pvc BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_sub VARCHAR(255)",
         ]:
             await conn.execute(text(stmt))
