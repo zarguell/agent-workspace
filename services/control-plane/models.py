@@ -1,5 +1,6 @@
 """SQLAlchemy ORM models for the control-plane database."""
 
+import secrets
 import uuid
 from datetime import datetime, timezone
 
@@ -27,6 +28,11 @@ def _utcnow():
 
 def _new_uuid():
     return str(uuid.uuid4())
+
+
+def _new_canvas_key():
+    """Per-workspace secret for the workspace's Agent Canvas instance."""
+    return secrets.token_hex(32)
 
 
 class User(Base):
@@ -72,6 +78,12 @@ class Workspace(Base):
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
     started_at = Column(DateTime(timezone=True), nullable=True)
     last_activity_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Per-workspace secrets for the workspace's Agent Canvas instance.
+    # Persisted in the DB so they survive pod hibernate/recreate; the Canvas
+    # state dir is on the PVC but keys default to the container layer.
+    canvas_api_key = Column(String(64), nullable=False, default=_new_canvas_key)
+    canvas_secret_key = Column(String(64), nullable=False, default=_new_canvas_key)
 
     __table_args__ = (
         CheckConstraint(

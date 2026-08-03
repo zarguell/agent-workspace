@@ -2,6 +2,7 @@
 
 import os
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -33,6 +34,16 @@ async def get_session() -> AsyncSession:
 
 
 async def init_db():
-    """Create all tables. Safe to call on startup — runs CREATE TABLE IF NOT EXISTS."""
+    """Create all tables and apply lightweight migrations.
+
+    Safe to call on startup — CREATE TABLE IF NOT EXISTS for fresh installs,
+    plus idempotent ALTER TABLE for columns added after the first deploy.
+    """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Columns added in later versions — no-op on fresh installs
+        for stmt in [
+            "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS canvas_api_key VARCHAR(64)",
+            "ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS canvas_secret_key VARCHAR(64)",
+        ]:
+            await conn.execute(text(stmt))

@@ -41,4 +41,23 @@ RUN chmod +x /usr/local/bin/workspace-entrypoint
 ENTRYPOINT ["/usr/local/bin/workspace-entrypoint"]
 
 # Install Agent Canvas and Claude Code CLI
-RUN npm config set ignore-scripts true && npm install -g @openhands/agent-canvas@1.6.1 @agentclientprotocol/claude-agent-acp@latest
+RUN npm config set ignore-scripts true && npm install -g @openhands/agent-canvas@1.6.1 @agentclientprotocol/claude-agent-acp@0.64.2
+
+# Pin uv cache location so build-time pre-warm and runtime cache collide.
+# The reconciler passes the same UV_CACHE_DIR to workspace pods.
+ENV UV_CACHE_DIR=/opt/uv-cache
+
+# Pre-warm the agent-server Python environment (litellm build is slow — 2-4 min
+# on a fresh pod). Running --help resolves and installs the full dependency
+# closure into the uv cache baked into this image. Versions must match
+# @openhands/agent-canvas config/defaults.json (agentServer 1.37.0).
+RUN uvx --from openhands-agent-server==1.37.0 \
+      --with openhands-sdk==1.37.0 \
+      --with openhands-tools==1.37.0 \
+      --with openhands-workspace==1.37.0 \
+      --with "agent-client-protocol<0.11" \
+      agent-server --help >/dev/null 2>&1
+
+# Pre-warm the automation backend environment
+RUN uvx --from openhands-automation==1.3.1 \
+      uvicorn openhands.automation.app:app --help >/dev/null 2>&1

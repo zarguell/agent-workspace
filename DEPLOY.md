@@ -83,6 +83,22 @@ Open `http://example.com:<nodeport>/` in a browser. Login with the default admin
 | `ANTHROPIC_API_KEY` | — | API key for Claude Code ACP agent |
 | `PASEO_PASSWORD` | (auto-generated) | Password for Paseo daemon WebSocket auth |
 | `WORKSPACE_IMAGE` | `localhost:5000/agent-workspace:dev-latest` | Container image for workspace pods |
+| `OH_AGENT_SERVER_VERSION` | `1.37.0` | Pinned agent-server version (must match image pre-warm) |
+| `UV_CACHE_DIR` | `/opt/uv-cache` | uv cache path (baked into image at build; reused at runtime) |
+
+### Workspace persistence
+
+Canvas credentials (`LOCAL_BACKEND_API_KEY`, `OH_SECRET_KEY`) are generated
+per-workspace and stored in Postgres (`workspaces.canvas_api_key`,
+`workspaces.canvas_secret_key`), then injected into workspace pods. This keeps
+reconnect and settings encryption stable across pod hibernate/recreate — the
+keys no longer live on the ephemeral container layer.
+
+The workspace image pre-warms the agent-server Python environment into
+`/opt/uv-cache` at build time, so fresh pods skip the multi-minute litellm
+build. The reconciler pins `OH_AGENT_SERVER_VERSION` and `UV_CACHE_DIR` to
+match the image. If you change the agent-server version in the Dockerfile,
+update `reconciler.py`'s `OH_AGENT_SERVER_VERSION` to match.
 
 ### Helm values.yaml
 

@@ -7,6 +7,7 @@ and transitions workspace states.
 import asyncio
 import logging
 import os
+import secrets
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -30,6 +31,10 @@ WORKSPACE_IMAGE = os.environ.get(
     "localhost:5000/agent-workspace:dev-latest",
 )
 SERVICE_AUTH_TOKEN = os.environ.get("SERVICE_AUTH_TOKEN", "internal-service-token")
+
+def _new_canvas_key() -> str:
+    """Generate a per-workspace Canvas credential."""
+    return secrets.token_hex(32)
 
 # K8s resource name helpers
 def _ns_name(user_id: str) -> str:
@@ -180,7 +185,14 @@ class Reconciler:
 
     # ─── Deployment ─────────────────────────────────────────────────────
 
-    def _ensure_deployment(self, user_id: str, image: str, replicas: int = 1):
+    def _ensure_deployment(
+        self,
+        user_id: str,
+        image: str,
+        replicas: int = 1,
+        canvas_api_key: str = "",
+        canvas_secret_key: str = "",
+    ):
         ns = _ns_name(user_id)
         name = _deploy_name(user_id)
         try:
@@ -214,6 +226,14 @@ class Reconciler:
                         client.V1EnvVar(name="ANTHROPIC_API_KEY", value=ANTHROPIC_API_KEY or ""),
                         client.V1EnvVar(name="AGENT_PORT", value="9000"),
                         client.V1EnvVar(name="OH_CANVAS_SAFE_STATE_DIR", value="/workspace/.openhands"),
+                        # Match the image's pre-warmed uv cache path (Dockerfile)
+                        client.V1EnvVar(name="UV_CACHE_DIR", value="/opt/uv-cache"),
+                        # Pin the agent-server version so the runtime uvx spec
+                        # matches the image pre-warm exactly (cache hit)
+                        client.V1EnvVar(name="OH_AGENT_SERVER_VERSION", value="1.37.0"),
+                        # Pin Canvas credentials so reconnect survives pod recreate
+                        client.V1EnvVar(name="LOCAL_BACKEND_API_KEY", value=canvas_api_key),
+                        client.V1EnvVar(name="OH_SECRET_KEY", value=canvas_secret_key),
                     ],
                     resources=client.V1ResourceRequirements(
                         requests={"cpu": "512m", "memory": "1Gi"},
@@ -393,7 +413,28 @@ class Reconciler:
                 self._ensure_service(user_id)
                 self._ensure_resource_quota(user_id)
                 self._ensure_network_policy(user_id)
-                self._ensure_deployment(user_id, ws.image or WORKSPACE_IMAGE, replicas=1)
+                canvas_api_key = ws.canvas_api_key or _new_canvas_key()
+                canvas_secret_key = ws.canvas_secret_key or _new_canvas_key()
+                if not ws.canvas_api_key or not ws.canvas_secret_key:
+                    # Persist generated keys so they survive future pod recreates
+                    async with async_session_factory() as db:
+                        await db.execute(
+                            update(Workspace)
+                            .where(Workspace.workspace_id == ws.workspace_id)
+                            .values(
+                                canvas_api_key=canvas_api_key,
+                                canvas_secret_key=canvas_secret_key,
+                            )
+                        )
+                        await db.commit()
+                    logger.info("Persisted Canvas keys for workspace %s", ws.workspace_id)
+                self._ensure_deployment(
+                    user_id,
+                    ws.image or WORKSPACE_IMAGE,
+                    replicas=1,
+                    canvas_api_key=canvas_api_key,
+                    canvas_secret_key=canvas_secret_key,
+                )
             except Exception as e:
                 logger.error("Failed to create K8s resources for workspace %s: %s", ws.workspace_id, e)
                 return  # Will be retried on next poll
