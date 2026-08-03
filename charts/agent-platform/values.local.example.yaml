@@ -26,6 +26,9 @@ serviceAuthToken: "CHANGE_ME"          # ⚠ shared secret between gateway and c
 
 idleTimeoutMinutes: 15                 # workspace hibernation after N min idle
 
+# Optional HTTPS via Traefik websecure entrypoint.
+# Local self-signed: run scripts/generate-selfsigned-cert.sh, then enable.
+
 # Pod resource requests/limits — tune for your hardware
 resources:
   controlPlane:

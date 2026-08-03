@@ -98,6 +98,85 @@ Open `http://example.com:<nodeport>/` in a browser. Login with the default admin
 | `anthropicApiKey` | — | Anthropic API key for Claude Code |
 | `idleTimeoutMinutes` | `15` | Workspace idle timeout before hibernation |
 
+### TLS / HTTPS
+
+| Key | Default | Description |
+|---|---|---|
+| `tls.enabled` | `false` | Serve HTTPS via the Traefik `websecure` entrypoint |
+| `tls.secretName` | `agent-platform-tls` | Name of the TLS secret holding the cert + key |
+
+## HTTPS
+
+### Local deployment (self-signed)
+
+The chart ships with a script that generates a self-signed CA + leaf certificate
+and installs it as a Kubernetes TLS secret:
+
+```bash
+./scripts/generate-selfsigned-cert.sh agent-platform agents.local.test
+```
+
+Then enable TLS in `values.local.yaml` and re-deploy:
+
+```yaml
+tls:
+  enabled: true
+```
+
+```bash
+helm upgrade --install agent-platform charts/agent-platform \
+  -f charts/agent-platform/values.local.yaml --namespace agent-platform
+```
+
+To avoid browser warnings, trust the generated CA certificate on each client
+machine (`certs/agent-platform-ca.crt`) — or accept the warning once per browser.
+The certificate includes SANs for `{domain}`, `*.{domain}`, `localhost`, and
+`127.0.0.1`.
+
+**Ports:** Traefik exposes the `websecure` entrypoint on NodePort `30118` by
+default. Forward it the same way you forward the HTTP port — e.g. an SSH tunnel:
+
+```bash
+ssh -L 31061:localhost:30118 root@<server>
+```
+
+Then access `https://agents.local.test:31061/`.
+
+> The private key lives only in `certs/` (gitignored) and in the in-cluster
+> Secret — never commit it.
+
+### Production (Let's Encrypt)
+
+For real certificates, use [cert-manager](https://cert-manager.io) with a
+`ClusterIssuer` for Let's Encrypt, then point `tls.secretName` at the
+cert-manager-issued secret:
+
+1. Install cert-manager and create a `ClusterIssuer` (HTTP-01 or DNS-01
+   challenge; DNS-01 works for wildcard certs).
+2. Create a certificate resource for your domain:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: agent-platform-tls
+  namespace: agent-platform
+spec:
+  secretName: agent-platform-tls
+  dnsNames:
+    - example.com
+    - "*.example.com"
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+```
+
+3. Set `tls.enabled: true` in `values.local.yaml` and re-deploy. Traefik will
+   serve the cert-manager-issued certificate.
+
+The gateway terminates TLS at Traefik and proxies plain HTTP internally, so no
+application code changes are needed for HTTPS.
+
 ## Accessing Services
 
 | URL | Service | Access |

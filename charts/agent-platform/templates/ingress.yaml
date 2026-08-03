@@ -9,9 +9,15 @@ metadata:
     app.kubernetes.io/name: agent-platform
     app.kubernetes.io/instance: {{ .Release.Name }}
   annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: web
+    traefik.ingress.kubernetes.io/router.entrypoints: web{{ if .Values.tls.enabled }},websecure{{ end }}
 spec:
   ingressClassName: traefik
+  {{- if .Values.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.baseDomain | quote }}
+      secretName: {{ .Values.tls.secretName }}
+  {{- end }}
   rules:
     - host: {{ .Values.baseDomain | quote }}
       http:

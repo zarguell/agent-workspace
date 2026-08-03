@@ -26,7 +26,8 @@ Living document. Open an issue or PR to suggest changes.
 
 ## Phase 3: Deployment & Infrastructure
 
-- [ ] **HTTPS/TLS** — Let's Encrypt via Traefik (already uses Traefik, minimal config change)
+- [x] **Local HTTPS** — self-signed cert script + Traefik `websecure` entrypoint (gated by `tls.enabled`)
+- [ ] **Production HTTPS** — cert-manager + Let's Encrypt; docs shipped, verify against a live domain
 - [ ] **Docker Compose deployment** — single-machine setup without Kubernetes for small teams / evaluation
 - [ ] **MicroVM support** — evaluate Firecracker / microVM environments as an alternative to pod-based isolation
 - [ ] **Long-running tasks** — lightweight job system that survives workspace hibernation (keep processes running while reclaiming user pod resources)

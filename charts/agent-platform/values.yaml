@@ -34,6 +34,12 @@ resources:
       cpu: 250m
       memory: 512Mi
 serviceAuthToken: dev-service-token-123
+tls:
+  # Serve HTTPS via the Traefik websecure entrypoint.
+  # Local self-signed: run scripts/generate-selfsigned-cert.sh, then set enabled: true.
+  # Production: use cert-manager + Let's Encrypt and point secretName at its secret.
+  enabled: false
+  secretName: agent-platform-tls
 workspaceDefaults:
   resourceLimits:
     cpu: 2

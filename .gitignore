@@ -31,3 +31,4 @@ services/workspace/uv.tar.gz
 
 # Logs
 *.log
+certs/
