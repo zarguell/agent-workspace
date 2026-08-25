@@ -19,13 +19,25 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
+      # PGDATA is pinned explicitly so the mounted named volume below is the
+      # single source of truth for the cluster's data directory.
+      #
+      # PostgreSQL major versions cannot share a data directory: a PG18 server
+      # refuses to start on a data dir initialized by PG16, and PG18's initdb
+      # enables data checksums by default. See docs/postgres-major-upgrade.md.
+      PGDATA: /var/lib/postgresql/data
       POSTGRES_USER: agent
       POSTGRES_PASSWORD: agent
       POSTGRES_DB: agentplatform
     ports:
       - "${POSTGRES_PORT:-15432}:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # Version-pinned named volume: each PostgreSQL major gets its own data
+      # directory so a major-version bump (e.g. 16 -> 18) always starts from a
+      # freshly initdb'd, PG18-compatible volume instead of reusing an
+      # incompatible PG16 directory. The previous `pgdata` volume is left
+      # untouched (never corrupted); migrate it per docs/postgres-major-upgrade.md.
+      - pgdata18:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U agent -d agentplatform"]
       interval: 5s
@@ -100,4 +112,4 @@ services:
       - "18099:18099"
 
 volumes:
-  pgdata:
+  pgdata18:

@@ -425,6 +425,14 @@ scripts/restore.sh
 docker compose restart control-plane
 ```
 
+> **Major Postgres upgrades (e.g. `16-alpine` → `18-alpine`):** PostgreSQL
+> major versions cannot share a data directory, and PG18 enables data checksums
+> by default at `initdb`. The compose volume is version-pinned (`pgdata18`) so a
+> fresh checkout always starts from a clean PG18 directory; the previous `pgdata`
+> volume is retired (never corrupted). For the exact fresh-start vs `pg_upgrade`
+> steps — including the checksums caveat — see
+> [`docs/postgres-major-upgrade.md`](docs/postgres-major-upgrade.md).
+
 ### Kubernetes deployments
 
 ```bash
